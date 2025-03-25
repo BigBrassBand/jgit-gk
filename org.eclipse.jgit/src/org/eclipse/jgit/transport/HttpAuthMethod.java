@@ -43,12 +43,13 @@ import org.ietf.jgss.Oid;
  * Instances of an HttpAuthMethod are not thread-safe, as some implementations
  * may need to maintain per-connection state information.
  */
-abstract class HttpAuthMethod {
+public abstract class HttpAuthMethod {
 	/**
 	 * Enum listing the http authentication method types supported by jgit. They
 	 * are sorted by priority order!!!
 	 */
 	public enum Type {
+		/** NONE */
 		NONE {
 			@Override
 			public HttpAuthMethod method(String hdr) {
@@ -60,6 +61,7 @@ abstract class HttpAuthMethod {
 				return "None"; //$NON-NLS-1$
 			}
 		},
+		/** BASIC */
 		BASIC {
 			@Override
 			public HttpAuthMethod method(String hdr) {
@@ -71,6 +73,7 @@ abstract class HttpAuthMethod {
 				return "Basic"; //$NON-NLS-1$
 			}
 		},
+		/** DIGEST */
 		DIGEST {
 			@Override
 			public HttpAuthMethod method(String hdr) {
@@ -82,6 +85,19 @@ abstract class HttpAuthMethod {
 				return "Digest"; //$NON-NLS-1$
 			}
 		},
+		/** NTLM */
+		NTLM {
+			@Override
+			public HttpAuthMethod method(String hdr) {
+				return new NTLM();
+			}
+
+			@Override
+			public String getSchemeName() {
+				return "NTLM"; //$NON-NLS-1$
+			}
+		},
+		/** NEGOTIATE */
 		NEGOTIATE {
 			@Override
 			public HttpAuthMethod method(String hdr) {
@@ -123,7 +139,7 @@ abstract class HttpAuthMethod {
 	 * @return new authentication method to try.
 	 */
 	static HttpAuthMethod scanResponse(final HttpConnection conn,
-			Collection<Type> ignoreTypes) {
+									   Collection<Type> ignoreTypes) {
 		final Map<String, List<String>> headers = conn.getHeaderFields();
 		HttpAuthMethod authentication = Type.NONE.method(EMPTY_STRING);
 
@@ -169,6 +185,7 @@ abstract class HttpAuthMethod {
 		return authentication;
 	}
 
+	/** javadoc stub */
 	protected final Type type;
 
 	/**
@@ -223,20 +240,16 @@ abstract class HttpAuthMethod {
 	/**
 	 * Update this method with the given username and password pair.
 	 *
-	 * @param user
-	 *            username
-	 * @param pass
-	 *            password
+	 * @param user user
+	 * @param pass pass
 	 */
 	abstract void authorize(String user, String pass);
 
 	/**
 	 * Update connection properties based on this authentication method.
 	 *
-	 * @param conn
-	 *            the connection to configure
-	 * @throws IOException
-	 *             if an IO error occurred
+	 * @param conn conn
+	 * @throws IOException IOException
 	 */
 	abstract void configureRequest(HttpConnection conn) throws IOException;
 
@@ -527,6 +540,69 @@ abstract class HttpAuthMethod {
 			} catch (GSSException e) {
 				throw new IOException(e);
 			}
+		}
+	}
+
+	/**
+	 * NTLM implementation
+	 */
+	public static class NTLM extends HttpAuthMethod {
+
+		/**
+		 * RequestConfigurer interface
+		 */
+		public interface RequestConfigurer {
+			/**
+			 * @param conn conn
+			 * @param username username
+			 * @param password password
+			 * @param domain domain
+			 * @throws IOException IOException
+			 */
+			void configureRequest(
+					HttpConnection conn,
+					String username,
+					String password,
+					String domain) throws IOException;
+		}
+
+		/**
+		 * request configurer
+		 */
+		public static RequestConfigurer requestConfigurer = null;
+
+		private String username;
+		private String password;
+		private String domain;
+
+		/**
+		 * Constructor
+		 */
+		public NTLM() {
+			super(Type.NTLM);
+		}
+
+		/** {@inheritDoc} */
+		@Override
+		void authorize(final String username, final String password) {
+			// supported username formats: https://msdn.microsoft.com/en-us/library/windows/desktop/aa380525(v=vs.85).aspx
+			// DOMAIN\UserName
+			this.username = username;
+			this.password = password;
+			String[] res = username.split("(\\\\|%5[Cc])");
+			if (res.length > 1) {
+				this.domain = res[0];
+				this.username = res[1];
+			}
+		}
+
+		/** {@inheritDoc} */
+		@Override
+		void configureRequest(HttpConnection conn) throws IOException {
+			if (requestConfigurer == null) {
+				return;
+			}
+			requestConfigurer.configureRequest(conn, username, password, domain);
 		}
 	}
 }
