@@ -518,7 +518,11 @@ public abstract class PackParser {
 			resolving = NullProgressMonitor.INSTANCE;
 
 		if (receiving == resolving)
-			receiving.start(2 /* tasks */);
+			// It also should take into account 3 remote steps:
+			//  - "remote: Enumerating objects" (total =0, undetermined)
+			//  - "remote: Counting objects" (total =1)
+			//  - "remote: Compressing objects" (total >0, depends on previous step)
+			receiving.start(2 /* tasks */ + 3 /* from remote */);
 		try {
 			readPackHeader();
 
