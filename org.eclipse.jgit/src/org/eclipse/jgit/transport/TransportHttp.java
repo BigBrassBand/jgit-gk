@@ -566,6 +566,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 		return p;
 	}
 
+	/** {@inheritDoc} */
 	@Override
 	public void close() {
 		if (gitSession != null) {
@@ -640,6 +641,16 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 			TransferConfig.ProtocolVersion protocolVersion)
 			throws TransportException, NotSupportedException {
 		URL u = getServiceURL(service);
+
+		final CredentialsProvider credentialsProvider = getCredentialsProvider();
+		if (credentialsProvider != null) {
+			final HttpAuthMethod defaultAuthMethod = credentialsProvider.getDefaultAuthMethod();
+			if (HttpAuthMethod.Type.NONE != defaultAuthMethod.getType()) {
+				authMethod = defaultAuthMethod;
+				authMethod.authorize(currentUri, credentialsProvider);
+			}
+		}
+
 		if (HttpAuthMethod.Type.NONE.equals(authMethod.getType())) {
 			authMethod = authFromUri(currentUri);
 		}
@@ -678,11 +689,27 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 							conn.getResponseMessage());
 
 				case HttpConnection.HTTP_UNAUTHORIZED:
+					// If auth present and it failed -- try another auth method
+					if (authMethod.getType() != HttpAuthMethod.Type.NONE) {
+						if (ignoreTypes == null) {
+							ignoreTypes = new HashSet<>();
+						}
+						ignoreTypes.add(authMethod.getType());
+
+						// reset auth method & attempts for next authentication type
+						authMethod = HttpAuthMethod.Type.NONE.method(null);
+						authAttempts = 1;
+					}
 					authMethod = HttpAuthMethod.scanResponse(conn, ignoreTypes);
-					if (authMethod.getType() == HttpAuthMethod.Type.NONE)
-						throw new TransportException(uri, MessageFormat.format(
-								JGitText.get().authenticationNotSupported, uri));
-					CredentialsProvider credentialsProvider = getCredentialsProvider();
+					if (authMethod.getType() == HttpAuthMethod.Type.NONE) {
+						if (ignoreTypes == null || ignoreTypes.isEmpty()) {
+							throw new TransportException(uri, MessageFormat.format(
+									JGitText.get().authenticationNotSupported, uri));
+						} else {
+							// Some methods were ignored, thus it seems that auth failed, so report NOT_AUTHORIZED
+							throw new TransportException(uri, JGitText.get().notAuthorized);
+						}
+					}
 					if (credentialsProvider == null)
 						throw new TransportException(uri,
 								JGitText.get().noCredentialsProvider);
