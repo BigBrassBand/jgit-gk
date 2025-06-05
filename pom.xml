@@ -18,7 +18,7 @@
   <groupId>org.eclipse.jgit</groupId>
   <artifactId>org.eclipse.jgit-parent</artifactId>
   <packaging>pom</packaging>
-  <version>6.10.1.202505221210-r</version>
+  <version>6.10.1.202505221210-r-gk.2</version>
 
   <name>JGit - Parent</name>
   <url>${jgit-url}</url>
@@ -31,6 +31,14 @@
   <description>
     Pure Java implementation of Git
   </description>
+
+  <distributionManagement>
+    <repository>
+      <id>github</id>
+      <name>GitHub BigBrassBand Apache Maven Packages</name>
+      <url>https://maven.pkg.github.com/BigBrassBand/jira-git-plugin</url>
+    </repository>
+  </distributionManagement>
 
   <scm>
     <url>https://git.eclipse.org/r/plugins/gitiles/jgit/jgit</url>
@@ -1020,25 +1028,6 @@
     </dependencies>
   </dependencyManagement>
 
-  <distributionManagement>
-    <repository>
-      <id>repo.eclipse.org</id>
-      <name>JGit Maven Repository - Releases</name>
-      <url>https://repo.eclipse.org/content/repositories/jgit-releases/</url>
-    </repository>
-    <snapshotRepository>
-      <id>repo.eclipse.org</id>
-      <name>JGit Maven Repository - Snapshots</name>
-      <url>https://repo.eclipse.org/content/repositories/jgit-snapshots/</url>
-      <uniqueVersion>true</uniqueVersion>
-    </snapshotRepository>
-    <site>
-      <id>jgit.website</id>
-      <name>JGit Website</name>
-      <url>${jgit.website.url}</url>
-    </site>
-  </distributionManagement>
-
   <profiles>
     <profile>
       <id>javac</id>
@@ -1161,6 +1150,9 @@
   </profiles>
 
   <modules>
+
+<!--  GitKraken: I've disabled all test modules because we do not develop jGit  -->
+
     <module>org.eclipse.jgit</module>
     <module>org.eclipse.jgit.ant</module>
     <module>org.eclipse.jgit.archive</module>
@@ -1174,21 +1166,21 @@
     <module>org.eclipse.jgit.pgm</module>
     <module>org.eclipse.jgit.lfs</module>
     <module>org.eclipse.jgit.lfs.server</module>
-    <module>org.eclipse.jgit.junit</module>
-    <module>org.eclipse.jgit.junit.http</module>
-    <module>org.eclipse.jgit.junit.ssh</module>
+<!--    <module>org.eclipse.jgit.junit</module>-->
+<!--    <module>org.eclipse.jgit.junit.http</module>-->
+<!--    <module>org.eclipse.jgit.junit.ssh</module>-->
 
-    <module>org.eclipse.jgit.test</module>
-    <module>org.eclipse.jgit.ant.test</module>
-    <module>org.eclipse.jgit.gpg.bc.test</module>
-    <module>org.eclipse.jgit.http.test</module>
-    <module>org.eclipse.jgit.pgm.test</module>
-    <module>org.eclipse.jgit.lfs.test</module>
-    <module>org.eclipse.jgit.lfs.server.test</module>
-    <module>org.eclipse.jgit.ssh.apache.test</module>
-    <module>org.eclipse.jgit.ssh.jsch.test</module>
-    <module>org.eclipse.jgit.coverage</module>
-    <module>org.eclipse.jgit.benchmarks</module>
+<!--    <module>org.eclipse.jgit.test</module>-->
+<!--    <module>org.eclipse.jgit.ant.test</module>-->
+<!--    <module>org.eclipse.jgit.gpg.bc.test</module>-->
+<!--    <module>org.eclipse.jgit.http.test</module>-->
+<!--    <module>org.eclipse.jgit.pgm.test</module>-->
+<!--    <module>org.eclipse.jgit.lfs.test</module>-->
+<!--    <module>org.eclipse.jgit.lfs.server.test</module>-->
+<!--    <module>org.eclipse.jgit.ssh.apache.test</module>-->
+<!--    <module>org.eclipse.jgit.ssh.jsch.test</module>-->
+<!--    <module>org.eclipse.jgit.coverage</module>-->
+<!--    <module>org.eclipse.jgit.benchmarks</module>-->
   </modules>
 
 </project>
