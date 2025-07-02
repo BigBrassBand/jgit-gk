@@ -169,6 +169,13 @@
   </properties>
 
   <repositories>
+    <!-- Dependencies from GitHub: -->
+    <!-- eddsa 0.3.1-gk.1-->
+    <repository>
+      <id>github</id>
+      <name>GitHub BigBrassBand Apache Maven Packages</name>
+      <url>https://maven.pkg.github.com/BigBrassBand/jira-git-plugin</url>
+    </repository>
     <repository>
       <id>jgit-repository</id>
       <url>https://repo.eclipse.org/content/repositories/jgit-releases/</url>
