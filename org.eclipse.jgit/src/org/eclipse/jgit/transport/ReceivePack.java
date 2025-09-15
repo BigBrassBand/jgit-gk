@@ -2233,8 +2233,22 @@ public class ReceivePack {
 
 				sendStatusReport(null);
 			}
+			// BBB customization begin
+			// autoGc();
+			// BBB customization end
 		}
 	}
+
+	// BBB customization begin
+	//private void autoGc() {
+	//	Repository repo = getRepository();
+	//	if (!repo.getConfig().getBoolean(ConfigConstants.CONFIG_RECEIVE_SECTION,
+	//			ConfigConstants.CONFIG_KEY_AUTOGC, true)) {
+	// 		return;
+	// 	}
+	// 	repo.autoGC(NullProgressMonitor.INSTANCE);
+	//}
+	// BBB customization end
 
 	static ReceiveCommand parseCommand(String line)
 			throws PackProtocolException {

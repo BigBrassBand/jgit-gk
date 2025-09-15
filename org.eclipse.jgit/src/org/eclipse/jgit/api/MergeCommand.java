@@ -384,6 +384,9 @@ public class MergeCommand extends GitCommand<MergeResult> {
 									.call().getId();
 						}
 						mergeStatus = MergeStatus.MERGED;
+						// BBB customization begin
+						// getRepository().autoGC(monitor);
+						// BBB customization end
 					}
 					if (commit && squash) {
 						msg = JGitText.get().squashCommitNotUpdatingHEAD;
