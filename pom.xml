@@ -165,6 +165,10 @@
       <id>jgit-repository</id>
       <url>https://repo.eclipse.org/content/repositories/jgit-releases/</url>
     </repository>
+    <repository>
+        <id>github</id>
+        <url>https://maven.pkg.github.com/BigBrassBand/jira-git-plugin</url>
+    </repository>
   </repositories>
 
   <pluginRepositories>
