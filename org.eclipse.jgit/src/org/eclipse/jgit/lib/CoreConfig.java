@@ -281,7 +281,6 @@ public class CoreConfig {
 				ConfigConstants.CONFIG_KEY_TRUST_STAT);
 		if (tfs != null) {
 			if (ts == null) {
-				LOG.warn(JGitText.get().deprecatedTrustFolderStat);
 				return tfs.booleanValue() ? TrustStat.ALWAYS : TrustStat.NEVER;
 			}
 			LOG.warn(JGitText.get().precedenceTrustConfig);
