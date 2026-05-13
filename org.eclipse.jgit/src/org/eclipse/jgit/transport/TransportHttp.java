@@ -66,6 +66,7 @@ import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -94,6 +95,7 @@ import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.lib.StoredConfig;
 import org.eclipse.jgit.lib.SymbolicRef;
+import org.eclipse.jgit.transport.HttpAuthMethod.Type;
 import org.eclipse.jgit.transport.HttpConfig.HttpRedirectMode;
 import org.eclipse.jgit.transport.http.HttpConnection;
 import org.eclipse.jgit.transport.http.HttpConnectionFactory;
@@ -309,8 +311,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 	 *
 	 * @param uri
 	 *            a {@link org.eclipse.jgit.transport.URIish} object.
-	 * @throws org.eclipse.jgit.errors.NotSupportedException
-	 *             if URI is not supported by JGit
+	 * @throws org.eclipse.jgit.errors.NotSupportedException NotSupportedException
 	 * @since 4.9
 	 */
 	protected void setURI(URIish uri) throws NotSupportedException {
@@ -326,10 +327,8 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 	/**
 	 * Create a minimal HTTP transport with default configuration values.
 	 *
-	 * @param uri
-	 *            URI to create a HTTP transport for
-	 * @throws NotSupportedException
-	 *             if URI is not supported by JGit
+	 * @param uri uri
+	 * @throws NotSupportedException NotSupportedException
 	 */
 	TransportHttp(URIish uri) throws NotSupportedException {
 		super(uri);
@@ -358,8 +357,8 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 
 	@SuppressWarnings("resource") // Closed by caller
 	private FetchConnection getConnection(HttpConnection c, InputStream in,
-			String service, Collection<RefSpec> refSpecs,
-			String... additionalPatterns) throws IOException {
+										  String service, Collection<RefSpec> refSpecs,
+										  String... additionalPatterns) throws IOException {
 		BaseConnection f;
 		if (isSmartHttp(c, service)) {
 			InputStream withMark = in.markSupported() ? in
@@ -433,7 +432,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 	 * @since 5.11
 	 */
 	public void setPreemptiveBasicAuthentication(String username,
-			String password) {
+												 String password) {
 		if (factoryUsed) {
 			throw new IllegalStateException(JGitText.get().httpPreAuthTooLate);
 		}
@@ -447,6 +446,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 		}
 	}
 
+	/** {@inheritDoc} */
 	@Override
 	public FetchConnection openFetch() throws TransportException,
 			NotSupportedException {
@@ -455,7 +455,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 
 	@Override
 	public FetchConnection openFetch(Collection<RefSpec> refSpecs,
-			String... additionalPatterns)
+									 String... additionalPatterns)
 			throws NotSupportedException, TransportException {
 		final String service = SVC_UPLOAD_PACK;
 		try {
@@ -494,33 +494,33 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 					AcceptEncoding.GZIP);
 			int status = HttpSupport.response(conn);
 			switch (status) {
-			case HttpConnection.HTTP_OK: {
-				try (BufferedReader br = toBufferedReader(
-						openInputStream(conn))) {
-					String line = br.readLine();
-					if (line != null && line.startsWith(RefDirectory.SYMREF)) {
-						String target = line.substring(RefDirectory.SYMREF.length());
-						Ref r = refs.get(target);
-						if (r == null)
-							r = new ObjectIdRef.Unpeeled(Ref.Storage.NEW, target, null);
-						r = new SymbolicRef(HEAD, r);
-						refs.put(r.getName(), r);
-					} else if (line != null && ObjectId.isId(line)) {
-						Ref r = new ObjectIdRef.Unpeeled(Ref.Storage.NETWORK,
-								HEAD, ObjectId.fromString(line));
-						refs.put(r.getName(), r);
+				case HttpConnection.HTTP_OK: {
+					try (BufferedReader br = toBufferedReader(
+							openInputStream(conn))) {
+						String line = br.readLine();
+						if (line != null && line.startsWith(RefDirectory.SYMREF)) {
+							String target = line.substring(RefDirectory.SYMREF.length());
+							Ref r = refs.get(target);
+							if (r == null)
+								r = new ObjectIdRef.Unpeeled(Ref.Storage.NEW, target, null);
+							r = new SymbolicRef(HEAD, r);
+							refs.put(r.getName(), r);
+						} else if (line != null && ObjectId.isId(line)) {
+							Ref r = new ObjectIdRef.Unpeeled(Ref.Storage.NETWORK,
+									HEAD, ObjectId.fromString(line));
+							refs.put(r.getName(), r);
+						}
 					}
+					break;
 				}
-				break;
-			}
 
-			case HttpConnection.HTTP_NOT_FOUND:
-				break;
+				case HttpConnection.HTTP_NOT_FOUND:
+					break;
 
-			default:
-				throw new TransportException(uri, MessageFormat.format(
-						JGitText.get().cannotReadHEAD, Integer.valueOf(status),
-						conn.getResponseMessage()));
+				default:
+					throw new TransportException(uri, MessageFormat.format(
+							JGitText.get().cannotReadHEAD, Integer.valueOf(status),
+							conn.getResponseMessage()));
 			}
 		}
 
@@ -533,6 +533,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 		return new BufferedReader(new InputStreamReader(in, UTF_8));
 	}
 
+	/** {@inheritDoc} */
 	@Override
 	public PushConnection openPush() throws NotSupportedException,
 			TransportException {
@@ -559,7 +560,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 	}
 
 	private PushConnection smartPush(String service, HttpConnection c,
-			InputStream in) throws IOException, TransportException {
+									 InputStream in) throws IOException, TransportException {
 		BufferedInputStream inBuf = new BufferedInputStream(in);
 		readSmartHeaders(inBuf, service);
 		SmartHttpPushConnection p = new SmartHttpPushConnection(inBuf);
@@ -567,6 +568,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 		return p;
 	}
 
+	/** {@inheritDoc} */
 	@Override
 	public void close() {
 		if (gitSession != null) {
@@ -587,19 +589,8 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 		this.headers = headers;
 	}
 
-	/**
-	 * Get additional headers on the HTTP connection
-	 *
-	 * @return unmodifiable map of additional name:values that are set as
-	 *         headers on the HTTP connection
-	 * @since 6.6
-	 */
-	public Map<String, String> getAdditionalHeaders() {
-		return Collections.unmodifiableMap(headers);
-	}
-
 	private NoRemoteRepositoryException createNotFoundException(URIish u,
-			URL url, String msg) {
+																URL url, String msg) {
 		String text;
 		if (msg != null && !msg.isEmpty()) {
 			text = MessageFormat.format(JGitText.get().uriNotFoundWithMessage,
@@ -625,7 +616,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 				basic.authorize(user, pass);
 				return basic;
 			} catch (IllegalArgumentException
-					| UnsupportedEncodingException e) {
+					 | UnsupportedEncodingException e) {
 				LOG.warn(JGitText.get().httpUserInfoDecodeError, u);
 			}
 		}
@@ -638,15 +629,25 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 	}
 
 	private HttpConnection connect(String service,
-			TransferConfig.ProtocolVersion protocolVersion)
+								   TransferConfig.ProtocolVersion protocolVersion)
 			throws TransportException, NotSupportedException {
 		URL u = getServiceURL(service);
+
+		final CredentialsProvider credentialsProvider = getCredentialsProvider();
+		if (credentialsProvider != null) {
+			final HttpAuthMethod defaultAuthMethod = credentialsProvider.getDefaultAuthMethod();
+			if (Type.NONE != defaultAuthMethod.getType()) {
+				authMethod = defaultAuthMethod;
+				authMethod.authorize(currentUri, credentialsProvider);
+			}
+		}
+
 		if (HttpAuthMethod.Type.NONE.equals(authMethod.getType())) {
 			authMethod = authFromUri(currentUri);
 		}
 		int authAttempts = 1;
 		int redirects = 0;
-		Collection<HttpAuthMethod.Type> ignoreTypes = null;
+		Collection<Type> ignoreTypes = null;
 		for (;;) {
 			try {
 				final HttpConnection conn = httpOpen(METHOD_GET, u, AcceptEncoding.GZIP);
@@ -664,69 +665,85 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 				final int status = HttpSupport.response(conn);
 				processResponseCookies(conn);
 				switch (status) {
-				case HttpConnection.HTTP_OK:
-					// Check if HttpConnection did some authentication in the
-					// background (e.g Kerberos/SPNEGO).
-					// That may not work for streaming requests and jgit
-					// explicit authentication would be required
-					if (authMethod.getType() == HttpAuthMethod.Type.NONE
-							&& conn.getHeaderField(HDR_WWW_AUTHENTICATE) != null)
+					case HttpConnection.HTTP_OK:
+						// Check if HttpConnection did some authentication in the
+						// background (e.g Kerberos/SPNEGO).
+						// That may not work for streaming requests and jgit
+						// explicit authentication would be required
+						if (authMethod.getType() == HttpAuthMethod.Type.NONE
+								&& conn.getHeaderField(HDR_WWW_AUTHENTICATE) != null)
+							authMethod = HttpAuthMethod.scanResponse(conn, ignoreTypes);
+						return conn;
+
+					case HttpConnection.HTTP_NOT_FOUND:
+						throw createNotFoundException(uri, u,
+								conn.getResponseMessage());
+
+					case HttpConnection.HTTP_UNAUTHORIZED:
+						// If auth present and it failed -- try another auth method
+						if (authMethod.getType() != Type.NONE) {
+							if (ignoreTypes == null) {
+								ignoreTypes = new HashSet<>();
+							}
+							ignoreTypes.add(authMethod.getType());
+
+							// reset auth method & attempts for next authentication type
+							authMethod = Type.NONE.method(null);
+							authAttempts = 1;
+						}
 						authMethod = HttpAuthMethod.scanResponse(conn, ignoreTypes);
-					return conn;
+						if (authMethod.getType() == HttpAuthMethod.Type.NONE) {
+							if (ignoreTypes == null || ignoreTypes.isEmpty()) {
+								throw new TransportException(uri, MessageFormat.format(
+										JGitText.get().authenticationNotSupported, uri));
+							} else {
+								// Some methods were ignored, thus it seems that auth failed, so report NOT_AUTHORIZED
+								throw new TransportException(uri, JGitText.get().notAuthorized);
+							}
+						}
+						if (credentialsProvider == null)
+							throw new TransportException(uri,
+									JGitText.get().noCredentialsProvider);
+						if (authAttempts > 1)
+							credentialsProvider.reset(currentUri);
+						if (3 < authAttempts
+								|| !authMethod.authorize(currentUri,
+								credentialsProvider)) {
+							throw new TransportException(uri,
+									JGitText.get().notAuthorized);
+						}
+						authAttempts++;
+						continue;
 
-				case HttpConnection.HTTP_NOT_FOUND:
-					throw createNotFoundException(uri, u,
-							conn.getResponseMessage());
-
-				case HttpConnection.HTTP_UNAUTHORIZED:
-					authMethod = HttpAuthMethod.scanResponse(conn, ignoreTypes);
-					if (authMethod.getType() == HttpAuthMethod.Type.NONE)
+					case HttpConnection.HTTP_FORBIDDEN:
 						throw new TransportException(uri, MessageFormat.format(
-								JGitText.get().authenticationNotSupported, uri));
-					CredentialsProvider credentialsProvider = getCredentialsProvider();
-					if (credentialsProvider == null)
-						throw new TransportException(uri,
-								JGitText.get().noCredentialsProvider);
-					if (authAttempts > 1)
-						credentialsProvider.reset(currentUri);
-					if (3 < authAttempts
-							|| !authMethod.authorize(currentUri,
-									credentialsProvider)) {
-						throw new TransportException(uri,
-								JGitText.get().notAuthorized);
-					}
-					authAttempts++;
-					continue;
+								JGitText.get().serviceNotPermitted, baseUrl,
+								service));
 
-				case HttpConnection.HTTP_FORBIDDEN:
-					throw new TransportException(uri, MessageFormat.format(
-							JGitText.get().serviceNotPermitted, baseUrl,
-							service));
-
-				case HttpConnection.HTTP_MOVED_PERM:
-				case HttpConnection.HTTP_MOVED_TEMP:
-				case HttpConnection.HTTP_SEE_OTHER:
-				case HttpConnection.HTTP_11_MOVED_PERM:
-				case HttpConnection.HTTP_11_MOVED_TEMP:
-					// SEE_OTHER should actually never be sent by a git server,
-					// and in general should occur only on POST requests. But it
-					// doesn't hurt to accept it here as a redirect.
-					if (http.getFollowRedirects() == HttpRedirectMode.FALSE) {
-						throw new TransportException(uri,
-								MessageFormat.format(
-										JGitText.get().redirectsOff,
-										Integer.valueOf(status)));
-					}
-					URIish newUri = redirect(u,
-							conn.getHeaderField(HDR_LOCATION),
-							Constants.INFO_REFS, redirects++);
-					setURI(newUri);
-					u = getServiceURL(service);
-					authAttempts = 1;
-					break;
-				default:
-					String err = status + " " + conn.getResponseMessage(); //$NON-NLS-1$
-					throw new TransportException(uri, err);
+					case HttpConnection.HTTP_MOVED_PERM:
+					case HttpConnection.HTTP_MOVED_TEMP:
+					case HttpConnection.HTTP_SEE_OTHER:
+					case HttpConnection.HTTP_11_MOVED_PERM:
+					case HttpConnection.HTTP_11_MOVED_TEMP:
+						// SEE_OTHER should actually never be sent by a git server,
+						// and in general should occur only on POST requests. But it
+						// doesn't hurt to accept it here as a redirect.
+						if (http.getFollowRedirects() == HttpRedirectMode.FALSE) {
+							throw new TransportException(uri,
+									MessageFormat.format(
+											JGitText.get().redirectsOff,
+											Integer.valueOf(status)));
+						}
+						URIish newUri = redirect(u,
+								conn.getHeaderField(HDR_LOCATION),
+								Constants.INFO_REFS, redirects++);
+						setURI(newUri);
+						u = getServiceURL(service);
+						authAttempts = 1;
+						break;
+					default:
+						String err = status + " " + conn.getResponseMessage(); //$NON-NLS-1$
+						throw new TransportException(uri, err);
 				}
 			} catch (NotSupportedException | TransportException e) {
 				throw e;
@@ -763,7 +780,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 
 	void processResponseCookies(HttpConnection conn) {
 		if (cookieFile != null && http.getSaveCookies()) {
-			List<HttpCookie> foundCookies = new ArrayList<>();
+			List<HttpCookie> foundCookies = new LinkedList<>();
 
 			List<String> cookieHeaderValues = conn
 					.getHeaderFields(HDR_SET_COOKIE);
@@ -784,7 +801,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 					cookieFile.write(baseUrl);
 					relevantCookies.addAll(foundCookies);
 				} catch (IOException | IllegalArgumentException
-						| InterruptedException e) {
+						 | InterruptedException e) {
 					LOG.warn(MessageFormat.format(
 							JGitText.get().couldNotPersistCookies,
 							cookieFile.getPath()), e);
@@ -794,8 +811,8 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 	}
 
 	private List<HttpCookie> extractCookies(String headerKey,
-			List<String> headerValues) {
-		List<HttpCookie> foundCookies = new ArrayList<>();
+											List<String> headerValues) {
+		List<HttpCookie> foundCookies = new LinkedList<>();
 		for (String headerValue : headerValues) {
 			foundCookies
 					.addAll(HttpCookie.parse(headerKey + ':' + headerValue));
@@ -821,7 +838,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 		/**
 		 * Trust the server for all git operations from this repository; may be
 		 * {@code null} if the transport was created via
-		 * {@link TransportHttp#TransportHttp(URIish)}.
+		 * {@link #TransportHttp(URIish)}.
 		 */
 		CredentialItem.YesNoType forRepo;
 
@@ -898,7 +915,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 		if (local != null) {
 			items.forRepo = new CredentialItem.YesNoType(
 					MessageFormat.format(JGitText.get().sslTrustForRepo,
-					local.getDirectory()));
+							local.getDirectory()));
 		}
 		items.always = new CredentialItem.YesNoType(
 				JGitText.get().sslTrustAlways);
@@ -935,7 +952,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 	}
 
 	private URIish redirect(URL currentUrl, String location, String checkFor,
-			int redirects)
+							int redirects)
 			throws TransportException {
 		if (location == null || location.isEmpty()) {
 			throw new TransportException(uri,
@@ -1034,19 +1051,15 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 	/**
 	 * Open an HTTP connection.
 	 *
-	 * @param method
-	 *            HTTP request method
-	 * @param u
-	 *            url of the HTTP connection
-	 * @param acceptEncoding
-	 *            accept-encoding header option
+	 * @param method HTTP request method
+	 * @param u url of the HTTP connection
+	 * @param acceptEncoding accept-encoding header option
 	 * @return the HTTP connection
-	 * @throws java.io.IOException
-	 *             if an IO error occurred
+	 * @throws java.io.IOException IOException
 	 * @since 4.6
 	 */
 	protected HttpConnection httpOpen(String method, URL u,
-			AcceptEncoding acceptEncoding) throws IOException {
+									  AcceptEncoding acceptEncoding) throws IOException {
 		if (method == null || u == null || acceptEncoding == null) {
 			throw new NullPointerException();
 		}
@@ -1199,7 +1212,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 	}
 
 	private static Set<HttpCookie> filterCookies(NetscapeCookieFile cookieFile,
-			URL url) {
+												 URL url) {
 		if (cookieFile != null) {
 			return filterCookies(cookieFile.getCookies(true), url);
 		}
@@ -1217,7 +1230,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 	 *         have a matching secure attribute)
 	 */
 	private static Set<HttpCookie> filterCookies(Set<HttpCookie> allCookies,
-			URL url) {
+												 URL url) {
 		Set<HttpCookie> filteredCookies = new HashSet<>();
 		for (HttpCookie cookie : allCookies) {
 			if (cookie.hasExpired()) {
@@ -1326,7 +1339,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 
 	private boolean isSmartHttp(HttpConnection c, String service) {
 		final String expType = "application/x-" + service + "-advertisement"; //$NON-NLS-1$ //$NON-NLS-2$
-		final String actType = c.getContentType();
+		final String actType = getContentType(c);
 		return expType.equals(actType);
 	}
 
@@ -1378,6 +1391,15 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 		while (!PacketLineIn.isEnd(pckIn.readString())) {
 			// for now, ignore the remaining header lines
 		}
+	}
+
+	/**
+	 * remove charset part
+	 * @param conn http connection
+	 * @return Returns String
+	 */
+	private String getContentType(HttpConnection conn) {
+		return null != conn.getContentType() ? conn.getContentType().split(";")[0] : null;
 	}
 
 	class HttpObjectDB extends WalkRemoteObjectDatabase {
@@ -1452,22 +1474,22 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 			final URL u = new URL(base, path);
 			final HttpConnection c = httpOpen(METHOD_GET, u, acceptEncoding);
 			switch (HttpSupport.response(c)) {
-			case HttpConnection.HTTP_OK:
-				final InputStream in = openInputStream(c);
-				// If content is being gzipped and then transferred, the content
-				// length in the header is the zipped content length, not the
-				// actual content length.
-				if (!isGzipContent(c)) {
-					final int len = c.getContentLength();
-					return new FileStream(in, len);
-				}
-				return new FileStream(in);
-			case HttpConnection.HTTP_NOT_FOUND:
-				throw new FileNotFoundException(u.toString());
-			default:
-				throw new IOException(u.toString() + ": " //$NON-NLS-1$
-						+ HttpSupport.response(c) + " " //$NON-NLS-1$
-						+ c.getResponseMessage());
+				case HttpConnection.HTTP_OK:
+					final InputStream in = openInputStream(c);
+					// If content is being gzipped and then transferred, the content
+					// length in the header is the zipped content length, not the
+					// actual content length.
+					if (!isGzipContent(c)) {
+						final int len = c.getContentLength();
+						return new FileStream(in, len);
+					}
+					return new FileStream(in);
+				case HttpConnection.HTTP_NOT_FOUND:
+					throw new FileNotFoundException(u.toString());
+				default:
+					throw new IOException(u.toString() + ": " //$NON-NLS-1$
+							+ HttpSupport.response(c) + " " //$NON-NLS-1$
+							+ c.getResponseMessage());
 			}
 		}
 
@@ -1537,7 +1559,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 		}
 
 		SmartHttpFetchConnection(InputStream advertisement,
-				Collection<RefSpec> refSpecs, String... additionalPatterns)
+								 Collection<RefSpec> refSpecs, String... additionalPatterns)
 				throws TransportException {
 			super(TransportHttp.this);
 			statelessRPC = true;
@@ -1555,7 +1577,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 
 		@Override
 		protected void doFetch(ProgressMonitor monitor, Collection<Ref> want,
-				Set<ObjectId> have, OutputStream outputStream)
+							   Set<ObjectId> have, OutputStream outputStream)
 				throws TransportException {
 			svc = new MultiRequestService(SVC_UPLOAD_PACK,
 					getProtocolVersion());
@@ -1592,12 +1614,12 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 
 		@Override
 		protected void doPush(ProgressMonitor monitor,
-				Map<String, RemoteRefUpdate> refUpdates,
-				OutputStream outputStream) throws TransportException {
+							  Map<String, RemoteRefUpdate> refUpdates,
+							  OutputStream outputStream) throws TransportException {
 			Service svc = new MultiRequestService(SVC_RECEIVE_PACK,
 					getProtocolVersion());
 			try (InputStream svcIn = svc.getInputStream();
-					OutputStream svcOut = svc.getOutputStream()) {
+				 OutputStream svcOut = svc.getOutputStream()) {
 				init(svcIn, svcOut);
 				super.doPush(monitor, refUpdates, outputStream);
 			} catch (TransportException e) {
@@ -1666,8 +1688,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 			}
 
 			HttpAuthMethod authenticator = null;
-			Collection<HttpAuthMethod.Type> ignoreTypes = EnumSet
-					.noneOf(HttpAuthMethod.Type.class);
+			Collection<Type> ignoreTypes = EnumSet.noneOf(Type.class);
 			// Counts number of repeated authentication attempts using the same
 			// authentication scheme
 			int authAttempts = 1;
@@ -1691,106 +1712,106 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 
 					final int status = HttpSupport.response(conn);
 					switch (status) {
-					case HttpConnection.HTTP_OK:
-						// We're done.
-						return;
-
-					case HttpConnection.HTTP_NOT_FOUND:
-						throw createNotFoundException(uri, conn.getURL(),
-								conn.getResponseMessage());
-
-					case HttpConnection.HTTP_FORBIDDEN:
-						throw new TransportException(uri,
-								MessageFormat.format(
-										JGitText.get().serviceNotPermitted,
-										baseUrl, serviceName));
-
-					case HttpConnection.HTTP_MOVED_PERM:
-					case HttpConnection.HTTP_MOVED_TEMP:
-					case HttpConnection.HTTP_11_MOVED_PERM:
-					case HttpConnection.HTTP_11_MOVED_TEMP:
-						// SEE_OTHER after a POST doesn't make sense for a git
-						// server, so we don't handle it here and thus we'll
-						// report an error in openResponse() later on.
-						if (http.getFollowRedirects() != HttpRedirectMode.TRUE) {
-							// Let openResponse() issue an error
+						case HttpConnection.HTTP_OK:
+							// We're done.
 							return;
-						}
-						currentUri = redirect(conn.getURL(),
-								conn.getHeaderField(HDR_LOCATION),
-								'/' + serviceName, redirects++);
-						try {
-							baseUrl = toURL(currentUri);
-						} catch (MalformedURLException e) {
-							throw new TransportException(uri,
-									MessageFormat.format(
-											JGitText.get().invalidRedirectLocation,
-											baseUrl, currentUri),
-									e);
-						}
-						continue;
 
-					case HttpConnection.HTTP_UNAUTHORIZED:
-						HttpAuthMethod nextMethod = HttpAuthMethod
-								.scanResponse(conn, ignoreTypes);
-						switch (nextMethod.getType()) {
-						case NONE:
+						case HttpConnection.HTTP_NOT_FOUND:
+							throw createNotFoundException(uri, conn.getURL(),
+									conn.getResponseMessage());
+
+						case HttpConnection.HTTP_FORBIDDEN:
 							throw new TransportException(uri,
 									MessageFormat.format(
-											JGitText.get().authenticationNotSupported,
-											conn.getURL()));
-						case NEGOTIATE:
-							// RFC 4559 states "When using the SPNEGO [...] with
-							// [...] POST, the authentication should be complete
-							// [...] before sending the user data." So in theory
-							// the initial GET should have been authenticated
-							// already. (Unless there was a redirect?)
-							//
-							// We try this only once:
-							ignoreTypes.add(HttpAuthMethod.Type.NEGOTIATE);
-							if (authenticator != null) {
-								ignoreTypes.add(authenticator.getType());
+											JGitText.get().serviceNotPermitted,
+											baseUrl, serviceName));
+
+						case HttpConnection.HTTP_MOVED_PERM:
+						case HttpConnection.HTTP_MOVED_TEMP:
+						case HttpConnection.HTTP_11_MOVED_PERM:
+						case HttpConnection.HTTP_11_MOVED_TEMP:
+							// SEE_OTHER after a POST doesn't make sense for a git
+							// server, so we don't handle it here and thus we'll
+							// report an error in openResponse() later on.
+							if (http.getFollowRedirects() != HttpRedirectMode.TRUE) {
+								// Let openResponse() issue an error
+								return;
 							}
-							authAttempts = 1;
-							// We only do the Kerberos part of SPNEGO, which
-							// requires only one round.
-							break;
+							currentUri = redirect(conn.getURL(),
+									conn.getHeaderField(HDR_LOCATION),
+									'/' + serviceName, redirects++);
+							try {
+								baseUrl = toURL(currentUri);
+							} catch (MalformedURLException e) {
+								throw new TransportException(uri,
+										MessageFormat.format(
+												JGitText.get().invalidRedirectLocation,
+												baseUrl, currentUri),
+										e);
+							}
+							continue;
+
+						case HttpConnection.HTTP_UNAUTHORIZED:
+							HttpAuthMethod nextMethod = HttpAuthMethod
+									.scanResponse(conn, ignoreTypes);
+							switch (nextMethod.getType()) {
+								case NONE:
+									throw new TransportException(uri,
+											MessageFormat.format(
+													JGitText.get().authenticationNotSupported,
+													conn.getURL()));
+								case NEGOTIATE:
+									// RFC 4559 states "When using the SPNEGO [...] with
+									// [...] POST, the authentication should be complete
+									// [...] before sending the user data." So in theory
+									// the initial GET should have been authenticated
+									// already. (Unless there was a redirect?)
+									//
+									// We try this only once:
+									ignoreTypes.add(HttpAuthMethod.Type.NEGOTIATE);
+									if (authenticator != null) {
+										ignoreTypes.add(authenticator.getType());
+									}
+									authAttempts = 1;
+									// We only do the Kerberos part of SPNEGO, which
+									// requires only one round.
+									break;
+								default:
+									// DIGEST or BASIC. Let's be sure we ignore
+									// NEGOTIATE; if it was available, we have tried it
+									// before.
+									ignoreTypes.add(HttpAuthMethod.Type.NEGOTIATE);
+									if (authenticator == null || authenticator
+											.getType() != nextMethod.getType()) {
+										if (authenticator != null) {
+											ignoreTypes.add(authenticator.getType());
+										}
+										authAttempts = 1;
+									}
+									break;
+							}
+							authMethod = nextMethod;
+							authenticator = nextMethod;
+							CredentialsProvider credentialsProvider = getCredentialsProvider();
+							if (credentialsProvider == null) {
+								throw new TransportException(uri,
+										JGitText.get().noCredentialsProvider);
+							}
+							if (authAttempts > 1) {
+								credentialsProvider.reset(currentUri);
+							}
+							if (3 < authAttempts || !authMethod
+									.authorize(currentUri, credentialsProvider)) {
+								throw new TransportException(uri,
+										JGitText.get().notAuthorized);
+							}
+							authAttempts++;
+							continue;
+
 						default:
-							// DIGEST or BASIC. Let's be sure we ignore
-							// NEGOTIATE; if it was available, we have tried it
-							// before.
-							ignoreTypes.add(HttpAuthMethod.Type.NEGOTIATE);
-							if (authenticator == null || authenticator
-									.getType() != nextMethod.getType()) {
-								if (authenticator != null) {
-									ignoreTypes.add(authenticator.getType());
-								}
-								authAttempts = 1;
-							}
-							break;
-						}
-						authMethod = nextMethod;
-						authenticator = nextMethod;
-						CredentialsProvider credentialsProvider = getCredentialsProvider();
-						if (credentialsProvider == null) {
-							throw new TransportException(uri,
-									JGitText.get().noCredentialsProvider);
-						}
-						if (authAttempts > 1) {
-							credentialsProvider.reset(currentUri);
-						}
-						if (3 < authAttempts || !authMethod
-								.authorize(currentUri, credentialsProvider)) {
-							throw new TransportException(uri,
-									JGitText.get().notAuthorized);
-						}
-						authAttempts++;
-						continue;
-
-					default:
-						// Just return here; openResponse() will report an
-						// appropriate error.
-						return;
+							// Just return here; openResponse() will report an
+							// appropriate error.
+							return;
 					}
 				} catch (SSLHandshakeException e) {
 					handleSslFailure(e);
@@ -1831,7 +1852,7 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 						+ conn.getResponseMessage());
 			}
 
-			final String contentType = conn.getContentType();
+			final String contentType = getContentType(conn);
 			if (!responseType.equals(contentType)) {
 				conn.getInputStream().close();
 				throw wrongContentType(responseType, contentType);
