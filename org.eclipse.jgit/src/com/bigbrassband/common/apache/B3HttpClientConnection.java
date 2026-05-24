@@ -84,6 +84,7 @@ import javax.net.ssl.TrustManager;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.ref.Cleaner;
 import java.util.concurrent.atomic.AtomicLong;
 import java.net.InetSocketAddress;
 import java.net.MalformedURLException;
@@ -111,8 +112,10 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_PUT;
  * @since 3.3
  */
 public class B3HttpClientConnection implements HttpConnection {
+	private static final Cleaner CLEANER = Cleaner.create();
 	private static final AtomicLong initCount = new AtomicLong(0);
 	private static final AtomicLong closeCount = new AtomicLong(0);
+	private static final AtomicLong abandonedCount = new AtomicLong(0);
 
 	private final B3HttpClientConnectionFactory.HttpClientConnectionManagerFactory httpClientConnectionManagerFactory;
 	private HttpClient client;
@@ -159,6 +162,10 @@ public class B3HttpClientConnection implements HttpConnection {
 
 	public static long getCloseCount() {
 		return closeCount.getAndSet(0L);
+	}
+
+	public static long getAbandonedCount() {
+		return abandonedCount.getAndSet(0L);
 	}
 
 	private HttpClient getClient() {
@@ -261,6 +268,7 @@ public class B3HttpClientConnection implements HttpConnection {
 	public B3HttpClientConnection(String urlStr, int connectTimeoutSeconds, Proxy proxy, HttpClient cl, B3HttpClientConnectionFactory.HttpClientConnectionManagerFactory httpClientConnectionManagerFactory)
 			throws MalformedURLException {
 		initCount.incrementAndGet();
+		CLEANER.register(this, abandonedCount::incrementAndGet);
 		this.client = cl;
 		this.url = new URL(urlStr);
 		this.proxy = proxy;
