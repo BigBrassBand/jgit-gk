@@ -156,14 +156,23 @@ public class B3HttpClientConnection implements HttpConnection {
 		this.credentialsProvider = credentialsProvider;
 	}
 
+	/**
+	 * @return number of connections created since last call (resets counter)
+	 */
 	public static long getInitCount() {
 		return initCount.getAndSet(0L);
 	}
 
+	/**
+	 * @return number of connections explicitly closed since last call (resets counter)
+	 */
 	public static long getCloseCount() {
 		return closeCount.getAndSet(0L);
 	}
 
+	/**
+	 * @return number of connections collected by GC without close since last call (resets counter)
+	 */
 	public static long getAbandonedCount() {
 		return abandonedCount.getAndSet(0L);
 	}
