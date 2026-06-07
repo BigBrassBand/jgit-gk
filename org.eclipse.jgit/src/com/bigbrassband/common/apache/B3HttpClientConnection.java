@@ -66,6 +66,7 @@ import org.apache.http.conn.socket.ConnectionSocketFactory;
 import org.apache.http.conn.socket.PlainConnectionSocketFactory;
 import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
 import org.apache.http.conn.ssl.X509HostnameVerifier;
+import org.apache.http.impl.NoConnectionReuseStrategy;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.impl.client.HttpClients;
 import org.apache.http.impl.conn.BasicHttpClientConnectionManager;
@@ -180,6 +181,7 @@ public class B3HttpClientConnection implements HttpConnection {
 	private HttpClient getClient() {
 		if (client == null) {
 			HttpClientBuilder clientBuilder = HttpClients.custom();
+			clientBuilder.setConnectionReuseStrategy(NoConnectionReuseStrategy.INSTANCE);
 			if(httpClientConnectionManagerFactory!=null)
 				clientBuilder.setConnectionManager(httpClientConnectionManagerFactory.getConnectionManager());
 			RequestConfig.Builder configBuilder = RequestConfig.custom();
