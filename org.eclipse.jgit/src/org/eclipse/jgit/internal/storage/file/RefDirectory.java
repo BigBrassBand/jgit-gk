@@ -48,6 +48,8 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
@@ -144,6 +146,9 @@ public class RefDirectory extends RefDatabase {
 
 	/** Immutable sorted list of packed references. */
 	final AtomicReference<PackedRefList> packedRefs = new AtomicReference<>();
+
+	private final AtomicReference<PackedRefsRefresher> packedRefsRefresher =
+			new AtomicReference<>();
 
 	/**
 	 * Lock for coordinating operations within a single process that may contend
@@ -678,41 +683,47 @@ public class RefDirectory extends RefDatabase {
 		}
 		String name = dst.getName();
 
-		// Write the packed-refs file using an atomic update. We might
-		// wind up reading it twice, before and after the lock, to ensure
-		// we don't miss an edit made externally.
-		PackedRefList packed = getPackedRefs();
-		if (packed.contains(name)) {
-			inProcessPackedRefsLock.lock();
+		// Get and keep the packed-refs lock while updating packed-refs and
+		// removing any loose ref
+		inProcessPackedRefsLock.lock();
+		try {
+			LockFile lck = lockPackedRefsOrThrow();
 			try {
-				LockFile lck = lockPackedRefsOrThrow();
-				try {
-					packed = refreshPackedRefs();
+				// Write the packed-refs file using an atomic update. We might
+				// wind up reading it twice, before and after checking if the
+				// ref to delete is included or not, to ensure
+				// we don't rely on a PackedRefList that is a result of in-memory
+				// or NFS caching.
+				PackedRefList packed = getPackedRefs();
+				if (packed.contains(name)) {
+					// Force update our packed-refs snapshot before writing
+					packed = getLockedPackedRefs(lck);
 					int idx = packed.find(name);
 					if (0 <= idx) {
 						commitPackedRefs(lck, packed.remove(idx), packed, true);
 					}
-				} finally {
-					lck.unlock();
+				}
+
+				RefList<LooseRef> curLoose, newLoose;
+				do {
+					curLoose = looseRefs.get();
+					int idx = curLoose.find(name);
+					if (idx < 0) {
+						break;
+					}
+					newLoose = curLoose.remove(idx);
+				} while (!looseRefs.compareAndSet(curLoose, newLoose));
+
+				int levels = levelsIn(name) - 2;
+				delete(logFor(name), levels);
+				if (dst.getStorage().isLoose()) {
+					deleteAndUnlock(fileFor(name), levels, update);
 				}
 			} finally {
-				inProcessPackedRefsLock.unlock();
+				lck.unlock();
 			}
-		}
-
-		RefList<LooseRef> curLoose, newLoose;
-		do {
-			curLoose = looseRefs.get();
-			int idx = curLoose.find(name);
-			if (idx < 0)
-				break;
-			newLoose = curLoose.remove(idx);
-		} while (!looseRefs.compareAndSet(curLoose, newLoose));
-
-		int levels = levelsIn(name) - 2;
-		delete(logFor(name), levels);
-		if (dst.getStorage().isLoose()) {
-			deleteAndUnlock(fileFor(name), levels, update);
+		} finally {
+			inProcessPackedRefsLock.unlock();
 		}
 
 		modCnt.incrementAndGet();
@@ -754,7 +765,7 @@ public class RefDirectory extends RefDatabase {
 		try {
 			LockFile lck = lockPackedRefsOrThrow();
 			try {
-				PackedRefList oldPacked = refreshPackedRefs();
+				PackedRefList oldPacked = getLockedPackedRefs(lck);
 				RefList<Ref> newPacked = oldPacked;
 
 				// Iterate over all refs to be packed
@@ -937,8 +948,55 @@ public class RefDirectory extends RefDatabase {
 	}
 
 	PackedRefList getPackedRefs() throws IOException {
-		final PackedRefList curList = packedRefs.get();
+		return refreshPackedRefsIfNeeded();
+	}
 
+	PackedRefList getLockedPackedRefs(LockFile packedRefsFileLock) throws IOException {
+		packedRefsFileLock.requireLock();
+		return refreshPackedRefsIfNeeded();
+	}
+
+	PackedRefList refreshPackedRefsIfNeeded() throws IOException {
+		PackedRefList curList = packedRefs.get();
+		if (!curList.shouldRefresh()) {
+			return curList;
+		}
+		return getPackedRefsRefresher(curList).getOrThrowIOException();
+	}
+
+	private PackedRefsRefresher getPackedRefsRefresher(PackedRefList curList)
+			throws IOException {
+		PackedRefsRefresher refresher = packedRefsRefresher.get();
+		if (refresher != null && !refresher.shouldRefresh()) {
+			return refresher;
+		}
+		// This synchronized is NOT needed for correctness. Instead it is used
+		// as a mechanism to try to avoid parallel reads of the same file content
+		// since repeating work, even in parallel, hurts performance.
+		// Unfortunately, this approach can still lead to some unnecessary re-reads
+		// during the "racy" window of the snapshot timestamp.
+		synchronized (this) {
+			if (packedRefsRefresher.get() != refresher) {
+				refresher = packedRefsRefresher.get();
+				if (refresher != null) {
+					// Refresher now guaranteed to have not started refreshing until
+					// after the current thread entered getPackedRefsRefresher(),
+					// even if it's currently out of date. And if the packed-refs
+					// lock is held before calling this method, then it is also
+					// guaranteed to not be out-of date even during the "racy"
+					// window of the snapshot timestamp.
+					return refresher;
+				}
+			}
+			refresher = new PackedRefsRefresher(curList);
+			packedRefsRefresher.set(refresher);
+		}
+		refresher.run();
+		packedRefsRefresher.compareAndSet(refresher, null);
+		return refresher;
+	}
+
+	private boolean shouldRefreshPackedRefs(FileSnapshot snapshot) throws IOException {
 		switch (trustPackedRefsStat) {
 		case NEVER:
 			break;
@@ -951,23 +1009,17 @@ public class RefDirectory extends RefDatabase {
 			}
 			//$FALL-THROUGH$
 		case ALWAYS:
-			if (!curList.snapshot.isModified(packedRefsFile)) {
-				return curList;
+			if (!snapshot.isModified(packedRefsFile)) {
+				return false;
 			}
 			break;
 		case UNSET:
-			if (trustFolderStat
-					&& !curList.snapshot.isModified(packedRefsFile)) {
-				return curList;
+			if (trustFolderStat && !snapshot.isModified(packedRefsFile)) {
+				return false;
 			}
 			break;
 		}
-
-		return refreshPackedRefs(curList);
-	}
-
-	PackedRefList refreshPackedRefs() throws IOException {
-		return refreshPackedRefs(packedRefs.get());
+		return true;
 	}
 
 	private PackedRefList refreshPackedRefs(PackedRefList curList)
@@ -991,7 +1043,7 @@ public class RefDirectory extends RefDatabase {
 										new DigestInputStream(
 												new FileInputStream(f), digest),
 										UTF_8))) {
-							return new PackedRefList(parsePackedRefs(br),
+							return new NonEmptyPackedRefList(parsePackedRefs(br),
 									snapshot,
 									ObjectId.fromRaw(digest.digest()));
 						}
@@ -1097,7 +1149,7 @@ public class RefDirectory extends RefDatabase {
 					throw new ObjectWritingException(MessageFormat.format(JGitText.get().unableToWrite, name));
 
 				byte[] digest = Constants.newMessageDigest().digest(content);
-				PackedRefList newPackedList = new PackedRefList(
+				PackedRefList newPackedList = new NonEmptyPackedRefList(
 						refs, lck.getCommitSnapshot(), ObjectId.fromRaw(digest));
 				packedRefs.compareAndSet(oldPackedList, newPackedList);
 				if (changed) {
@@ -1245,6 +1297,7 @@ public class RefDirectory extends RefDatabase {
 	 *            path of a loose ref relative to the repository root
 	 */
 	void refreshPathToLooseRef(Path refPath) {
+		boolean failed = false;
 		for (int i = 1; i < refPath.getNameCount(); i++) {
 			File dir = fileFor(refPath.subpath(0, i).toString());
 			// Use Files.newInputStream(Path) as it is consistent with other
@@ -1253,7 +1306,16 @@ public class RefDirectory extends RefDatabase {
 			try (InputStream stream = Files.newInputStream(dir.toPath())) {
 				// open the dir to refresh attributes (on some NFS clients)
 			} catch (IOException e) {
-				break; // loose ref may not exist
+				failed = true;
+				break; // directory may not exist
+			}
+		}
+		if (!failed) {
+			try (InputStream stream = Files.newInputStream(refPath)) {
+				// open the loose ref to refresh attributes (on some NFS
+				// clients)
+			} catch (IOException e) {
+				// loose ref may not exist
 			}
 		}
 	}
@@ -1446,21 +1508,57 @@ public class RefDirectory extends RefDatabase {
 	}
 
 	static class PackedRefList extends RefList<Ref> {
-
-		private final FileSnapshot snapshot;
-
 		private final ObjectId id;
 
-		private PackedRefList(RefList<Ref> src, FileSnapshot s, ObjectId i) {
+		PackedRefList() {
+			this(RefList.emptyList(), ObjectId.zeroId());
+		}
+
+		protected PackedRefList(RefList<Ref> src, ObjectId id) {
 			super(src);
-			snapshot = s;
-			id = i;
+			this.id = id;
+		}
+
+		public boolean shouldRefresh() throws IOException {
+			return true;
 		}
 	}
 
-	private static final PackedRefList NO_PACKED_REFS = new PackedRefList(
-			RefList.emptyList(), FileSnapshot.MISSING_FILE,
-			ObjectId.zeroId());
+	private static final PackedRefList NO_PACKED_REFS = new PackedRefList();
+
+	private class NonEmptyPackedRefList extends PackedRefList {
+		private final FileSnapshot snapshot;
+
+		private NonEmptyPackedRefList(RefList<Ref> src, FileSnapshot s, ObjectId id) {
+			super(src, id);
+			snapshot = s;
+		}
+
+		@Override
+		public boolean shouldRefresh() throws IOException {
+			return shouldRefreshPackedRefs(snapshot);
+		}
+	}
+
+	private class PackedRefsRefresher extends FutureTask<PackedRefList> {
+		private final FileSnapshot snapshot = FileSnapshot.save(packedRefsFile);
+
+		public PackedRefsRefresher(PackedRefList curList) {
+			super(() -> refreshPackedRefs(curList));
+		}
+
+		public PackedRefList getOrThrowIOException() throws IOException {
+			try {
+				return get();
+			} catch (ExecutionException | InterruptedException e) {
+				throw new IOException(e);
+			}
+		}
+
+		public boolean shouldRefresh() throws IOException {
+			return shouldRefreshPackedRefs(snapshot);
+		}
+	}
 
 	private static LooseSymbolicRef newSymbolicRef(FileSnapshot snapshot,
 			String name, String target) {

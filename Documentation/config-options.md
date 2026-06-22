@@ -55,15 +55,16 @@ For details on native git options see also the official [git config documentatio
 | `core.supportsAtomicFileCreation` | `true` | &#x20DE; | Whether the filesystem supports atomic file creation. |
 | `core.symlinks` | Auto detect if filesystem supports symlinks| &#x2705; | If false, symbolic links are checked out as small plain files that contain the link text. |
 | `core.trustFolderStat` | `true` | &#x20DE; | Whether to trust the pack folder's, packed-refs file's and loose-objects folder's file attributes (Java equivalent of stat command on *nix). When looking for pack files, if `false` JGit will always scan the `.git/objects/pack` folder and if set to `true` it assumes that pack files are unchanged if the file attributes of the pack folder are unchanged. When getting the list of packed refs, if `false` JGit will always read the packed-refs file and if set to `true` it uses the file attributes of the packed-refs file and will only read it if a file attribute has changed. When looking for loose objects, if `false` and if a loose object is not found, JGit will open and close a stream to `.git/objects` folder (which can refresh its directory listing, at least on some NFS clients) and retry looking for that loose object. Setting this option to `false` can help to workaround caching issues on NFS, but reduces performance. |
-| `core.trustPackedRefsStat` | `unset` | &#x20DE; | Whether to trust the file attributes (Java equivalent of stat command on *nix) of the packed-refs file. If `never` JGit will ignore the file attributes of the packed-refs file and always read it. If `always` JGit will trust the file attributes of the packed-refs file and will only read it if a file attribute has changed. `after_open` behaves the same as `always`, except that the packed-refs file is opened and closed before its file attributes are considered. An open/close of the packed-refs file is known to refresh its file attributes, at least on some NFS clients. If `unset`, JGit will use the behavior described in `trustFolderStat`. |
+| `core.trustPackedRefsStat` | `unset` | &#x20DE; | Whether to trust the file attributes (Java equivalent of stat command on *nix) of the packed-refs file. If `never` JGit will ignore the file attributes of the packed-refs file and always read it. If `always` JGit will trust the file attributes of the packed-refs file and will only read it if a file attribute has changed. `after_open` behaves the same as `always`, except that the packed-refs file is opened and closed before its file attributes are considered. An open/close of the packed-refs file is known to refresh its file attributes, at least on some NFS clients. If `unset`, JGit will use the behavior described in `trustFolderStat`. Note: since 6.10.2, this setting applies during both ref reads and ref updates, but previously only applied during reads.|
 | `core.trustLooseRefStat` | `always` | &#x20DE; | Whether to trust the file attributes (Java equivalent of stat command on *nix) of the loose ref. If `always` JGit will trust the file attributes of the loose ref and its parent directories. `after_open` behaves similar to `always`, except that all parent directories of the loose ref up to the repository root are opened and closed before its file attributes are considered. An open/close of these parent directories is known to refresh the file attributes, at least on some NFS clients. |
 | `core.worktree` | Root directory of the working tree if it is not the parent directory of the `.git` directory | &#x2705; | The path to the root of the working tree. |
 
 ## __fetch__ options
 
-|  option | default | git option | description |
-|---------|---------|------------|-------------|
+| option                    | default | git option | description                                                                                                                                         |
+|---------------------------|---------|------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|
 | `fetch.useNegotiationTip` | `false` | &#x2705; | When enabled it restricts the client negotiation on unrelated branches i.e. only send haves for the refs that the client is interested in fetching. |
+| `fetch.autogc`            | `true`  | &#x20DE; | Perform an automatic garbage collection after the fetch operation has been completed.                                                               |
 
 ## __gc__ options
 
@@ -129,6 +130,15 @@ Proxy configuration uses the standard Java mechanisms via class `java.net.ProxyS
 | `pack.waitPreventRacyPack` | `false` | &#x20DE; | Whether we wait before opening a newly written pack to prevent its lastModified timestamp could be racy. |
 | `pack.window` | `10` | &#x2705; | Number of objects to try when looking for a delta base per thread searching for deltas. |
 | `pack.windowMemory` | `0` (unlimited) | &#x2705; | Maximum number of bytes to put into the delta search window. |
+
+## __receive__ options
+
+| option           | default | git option | description                                                                                |
+|------------------|---------|------------|--------------------------------------------------------------------------------------------|
+| `receive.autogc` | `true`  | &#x2705; | Perform an automatic garbage collection after a receive-pack operation has been completed. |
+| `receive.maxCommandBytes` | `3 MiB` | &#x20DE; | Maximum number of bytes to read from the receive-pack command block before the pack data. If set to `0`, there is no limit. |
+| `receive.maxCommandDiscardBytes` | `-1` | &#x20DE; | Maximum number of command-block bytes to discard after `receive.maxCommandBytes` is exceeded, so JGit can report a side-band error before disconnecting. If set to `0`, there is no limit. If set to `-1`, JGit uses the larger of `3 * receive.maxCommandBytes` and `3 MiB`. |
+
 
 ## __repack__ options
 
