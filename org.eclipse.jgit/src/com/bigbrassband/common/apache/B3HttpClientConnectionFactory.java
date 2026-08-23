@@ -58,17 +58,27 @@ import java.net.URL;
 public class B3HttpClientConnectionFactory implements HttpConnectionFactory {
 
 	/**
+	 * Response bodies up to this size are buffered and the connection released before the caller
+	 * sees the response, unless a different limit is passed to
+	 * {@link #B3HttpClientConnectionFactory(HttpClientConnectionManagerFactory, int, int)}.
+	 * <p>
+	 * The buffer is held per exchange in flight, and a chunked body reaches the limit by doubling,
+	 * so peak heap is a small multiple of this figure times the number of concurrent requests.
+	 */
+	public static final int DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 1024 * 1024;
+
+	/**
 	 * HttpClientConnectionManagerFactory
 	 */
 	protected final HttpClientConnectionManagerFactory httpClientConnectionManagerFactory;
 	private final int connectTimeoutSeconds;
+	private final int maxBufferedResponseBytes;
 
 	/**
 	 * B3HttpClientConnectionFactory
 	 */
 	public B3HttpClientConnectionFactory() {
-		this.httpClientConnectionManagerFactory=null;
-		this.connectTimeoutSeconds=0;
+		this(null, 0, DEFAULT_MAX_BUFFERED_RESPONSE_BYTES);
 	}
 
 	/**
@@ -77,8 +87,7 @@ public class B3HttpClientConnectionFactory implements HttpConnectionFactory {
 	 * @param httpClientConnectionManagerFactory HttpClientConnectionManagerFactory
 	 */
 	public B3HttpClientConnectionFactory(HttpClientConnectionManagerFactory httpClientConnectionManagerFactory) {
-		this.httpClientConnectionManagerFactory=httpClientConnectionManagerFactory;
-		this.connectTimeoutSeconds=0;
+		this(httpClientConnectionManagerFactory, 0, DEFAULT_MAX_BUFFERED_RESPONSE_BYTES);
 	}
 
 	/**
@@ -89,8 +98,31 @@ public class B3HttpClientConnectionFactory implements HttpConnectionFactory {
 	 */
 	public B3HttpClientConnectionFactory(HttpClientConnectionManagerFactory httpClientConnectionManagerFactory,
                                          int connectTimeoutSeconds) {
+		this(httpClientConnectionManagerFactory, connectTimeoutSeconds, DEFAULT_MAX_BUFFERED_RESPONSE_BYTES);
+	}
+
+	/**
+	 * B3HttpClientConnectionFactory.
+	 *
+	 * @param httpClientConnectionManagerFactory HttpClientConnectionManagerFactory
+	 * @param connectTimeoutSeconds int
+	 * @param maxBufferedResponseBytes largest response body that is read into memory so that the
+	 *            connection can be released before the caller sees the response; bigger bodies are
+	 *            left streaming and release when the caller finishes the stream. Must be positive —
+	 *            a limit of zero would hold a socket open for every response nobody reads, which is
+	 *            the defect this buffering exists to remove, so it is refused rather than accepted.
+	 * @throws IllegalArgumentException if maxBufferedResponseBytes is not positive
+	 */
+	public B3HttpClientConnectionFactory(HttpClientConnectionManagerFactory httpClientConnectionManagerFactory,
+                                         int connectTimeoutSeconds,
+                                         int maxBufferedResponseBytes) {
+		if (maxBufferedResponseBytes <= 0) {
+			throw new IllegalArgumentException("maxBufferedResponseBytes must be positive: " //$NON-NLS-1$
+					+ maxBufferedResponseBytes);
+		}
 		this.httpClientConnectionManagerFactory=httpClientConnectionManagerFactory;
 		this.connectTimeoutSeconds=connectTimeoutSeconds;
+		this.maxBufferedResponseBytes=maxBufferedResponseBytes;
 	}
 
 	/**
@@ -102,7 +134,8 @@ public class B3HttpClientConnectionFactory implements HttpConnectionFactory {
 	 */
 	@Override
 	public HttpConnection create(URL url) throws IOException {
-		return new B3HttpClientConnection(url.toString(), connectTimeoutSeconds, httpClientConnectionManagerFactory);
+		return new B3HttpClientConnection(url.toString(), connectTimeoutSeconds, httpClientConnectionManagerFactory,
+				maxBufferedResponseBytes);
 	}
 
 	/**
@@ -117,7 +150,8 @@ public class B3HttpClientConnectionFactory implements HttpConnectionFactory {
 	@Override
 	public HttpConnection create(URL url, Proxy proxy)
 			throws IOException {
-		return new B3HttpClientConnection(url.toString(), connectTimeoutSeconds, proxy, httpClientConnectionManagerFactory);
+		return new B3HttpClientConnection(url.toString(), connectTimeoutSeconds, proxy,
+				httpClientConnectionManagerFactory, maxBufferedResponseBytes);
 	}
 
 	/**
