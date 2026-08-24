@@ -779,6 +779,9 @@ public class B3HttpClientConnection implements HttpConnection {
 					response.setEntity(withMetadataOf(body,
 							new BufferedBody(head.toByteArray(), framedLength)));
 					closeQuietly(in);
+					//that EOF already released the holder (ResponseEntityProxy.eofDetected), and
+					//ConnectionHolder's release is CAS-guarded, so this close is a no-op whatever the
+					//reuse strategy — kept so the branch does not lean on Apache's release ordering
 					closeQuietly(closeable);
 					exchange.bodyReleased(closeable);
 				} else {
@@ -788,10 +791,14 @@ public class B3HttpClientConnection implements HttpConnection {
 							new InputStreamEntity(whole, framedLength)));
 				}
 			} catch (IOException e) {
-				//a broken body used to surface when the caller read it, and still should; let go of
-				//the socket now and hand on both what did arrive and the failure that stopped it
+				//a broken body used to surface when the caller read it, and still should; hand on
+				//both what did arrive and the failure that stopped it
 				response.setEntity(withMetadataOf(body,
 						new FailedBody(head.toByteArray(), e, framedLength)));
+				//unlike its twin above, this close can be the only one there is. Swallowing the
+				//failure is what makes it so: ProtocolExec never sees the exception and so never
+				//closes the response, and a getContent() that threw before any EofSensorInputStream
+				//existed left nothing else holding the socket either
 				closeQuietly(closeable);
 				exchange.bodyReleased(closeable);
 			}
