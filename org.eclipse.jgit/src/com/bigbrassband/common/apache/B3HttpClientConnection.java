@@ -1021,22 +1021,35 @@ public class B3HttpClientConnection implements HttpConnection {
 			this.exchange = exchange;
 		}
 
+		//the fence in all three: this stream's cleanup action is registered on the exchange, not on
+		//the stream, so the stream may be collected while one of its own methods is still running
+		//— the only touch of this after the delegated call is a final field, which may be hoisted
+		//above it. A cleaner running in that window would close the socket under an active read
+		//and record the orderly close as an abandonment. Same hazard getInputStream() fences.
 		@Override
 		public int read() throws IOException {
-			int b = super.read();
-			if (b < 0) {
-				exchange.bodyFinished();
+			try {
+				int b = super.read();
+				if (b < 0) {
+					exchange.bodyFinished();
+				}
+				return b;
+			} finally {
+				Reference.reachabilityFence(this);
 			}
-			return b;
 		}
 
 		@Override
 		public int read(byte[] b, int off, int len) throws IOException {
-			int n = super.read(b, off, len);
-			if (n < 0) {
-				exchange.bodyFinished();
+			try {
+				int n = super.read(b, off, len);
+				if (n < 0) {
+					exchange.bodyFinished();
+				}
+				return n;
+			} finally {
+				Reference.reachabilityFence(this);
 			}
-			return n;
 		}
 
 		@Override
@@ -1044,7 +1057,11 @@ public class B3HttpClientConnection implements HttpConnection {
 			try {
 				super.close();
 			} finally {
-				exchange.bodyFinished();
+				try {
+					exchange.bodyFinished();
+				} finally {
+					Reference.reachabilityFence(this);
+				}
 			}
 		}
 	}
