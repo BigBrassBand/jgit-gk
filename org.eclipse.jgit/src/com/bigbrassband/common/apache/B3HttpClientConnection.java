@@ -100,6 +100,7 @@ import java.io.OutputStream;
 import java.io.SequenceInputStream;
 import java.lang.ref.Cleaner;
 import java.lang.ref.Reference;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -130,6 +131,9 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_PUT;
  */
 public class B3HttpClientConnection implements HttpConnection {
 	private static final Cleaner CLEANER = Cleaner.create();
+	//the socket timeout bounds one read, not the whole drain: read() returns as soon as any
+	//byte arrives, so a server sending one at a time is bounded only by the limit in bytes.
+	private static final int DRAIN_BUDGET_READ_TIMEOUTS = 5;
 	private static final AtomicLong initCount = new AtomicLong(0);
 	private static final AtomicLong closeCount = new AtomicLong(0);
 	private static final AtomicLong abandonedCount = new AtomicLong(0);
@@ -238,7 +242,8 @@ public class B3HttpClientConnection implements HttpConnection {
 			clientBuilder.setConnectionReuseStrategy(NoConnectionReuseStrategy.INSTANCE);
 			//first, so it runs ahead of ResponseContentEncoding and the limit then counts bytes off
 			//the wire rather than decompressed bytes
-			clientBuilder.addInterceptorFirst(new ResponseBodyDrain(exchange, maxBufferedResponseBytes));
+			clientBuilder.addInterceptorFirst(new ResponseBodyDrain(exchange, maxBufferedResponseBytes,
+					drainBudgetMillis()));
 			if(httpClientConnectionManagerFactory!=null)
 				clientBuilder.setConnectionManager(httpClientConnectionManagerFactory.getConnectionManager());
 			RequestConfig.Builder configBuilder = RequestConfig.custom();
@@ -277,6 +282,16 @@ public class B3HttpClientConnection implements HttpConnection {
 		}
 
 		return client;
+	}
+
+	//zero means the drain does not run. A read timeout of zero reaches setSocketTimeout as
+	//"wait forever", and jgit passes exactly that when the repository configures no timeout
+	//(RemoteConfig reads KEY_TIMEOUT with a default of 0), so a single read need never return.
+	private long drainBudgetMillis() {
+		if (readTimeoutMilliseconds == null || readTimeoutMilliseconds <= 0) {
+			return 0L;
+		}
+		return (long) readTimeoutMilliseconds * DRAIN_BUDGET_READ_TIMEOUTS;
 	}
 
 	private SSLContext getSSLContext() {
@@ -746,15 +761,21 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * <p>
 	 * Runs once per hop, so a redirect chain resolved inside httpclient reaches it for every response
 	 * in the chain and the exchange state moves back and forth accordingly.
+	 * <p>
+	 * Does not run at all without a finite read timeout to derive a budget from, since reading a
+	 * body the caller has not asked for must never be what blocks the caller forever.
 	 */
 	private static final class ResponseBodyDrain implements HttpResponseInterceptor {
 		private final Exchange exchange;
 
 		private final int maxBufferedBytes;
 
-		ResponseBodyDrain(Exchange exchange, int maxBufferedBytes) {
+		private final long budgetMillis;
+
+		ResponseBodyDrain(Exchange exchange, int maxBufferedBytes, long budgetMillis) {
 			this.exchange = exchange;
 			this.maxBufferedBytes = maxBufferedBytes;
+			this.budgetMillis = budgetMillis;
 		}
 
 		@Override
@@ -771,11 +792,17 @@ public class B3HttpClientConnection implements HttpConnection {
 				exchange.bodyReleased(closeable);
 				return;
 			}
+			if (budgetMillis <= 0) {
+				//nothing to mark: the state already says the body is on the socket, and
+				//streamedUnreadCount reports it if the caller then walks away from it
+				return;
+			}
 			long framedLength = body.getContentLength();
 			ByteArrayOutputStream head = newBuffer(framedLength);
 			try {
 				InputStream in = body.getContent();
-				if (readWithinLimit(in, head, maxBufferedBytes)) {
+				if (readWithinLimit(in, head, maxBufferedBytes,
+						System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMillis))) {
 					response.setEntity(withMetadataOf(body,
 							new BufferedBody(head.toByteArray(), framedLength)));
 					closeQuietly(in);
@@ -817,12 +844,18 @@ public class B3HttpClientConnection implements HttpConnection {
 		}
 
 		//true when the body ended within limit bytes, all of it now in head; false when it did not,
-		//head then holding the first limit + 1 bytes of it
-		private static boolean readWithinLimit(InputStream in, ByteArrayOutputStream head, int limit)
-				throws IOException {
+		//head then holding what had arrived by then — the first limit + 1 bytes of it, or less if
+		//the deadline came first. Giving up on the deadline costs nothing but the buffering: the
+		//caller is handed the prefix plus the rest of the socket either way.
+		private static boolean readWithinLimit(InputStream in, ByteArrayOutputStream head, int limit,
+			long deadlineNanos) throws IOException {
 			byte[] chunk = new byte[8192];
 			long read = 0;
 			while (read <= limit) {
+				//subtraction, not comparison: it stays correct across a nanoTime wrap
+				if (System.nanoTime() - deadlineNanos >= 0) {
+					return false;
+				}
 				int n = in.read(chunk, 0, (int) Math.min(chunk.length, limit + 1L - read));
 				if (n < 0) {
 					return true;
