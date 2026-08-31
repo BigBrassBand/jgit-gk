@@ -143,6 +143,13 @@ public class B3HttpClientConnection implements HttpConnection {
 	private final B3HttpClientConnectionFactory.HttpClientConnectionManagerFactory httpClientConnectionManagerFactory;
 	private final int maxBufferedResponseBytes;
 	private final Exchange exchange = new Exchange();
+	//CloseableHttpClient rather than HttpClient because only its execute() returns a
+	//CloseableHttpResponse, and the response is what has to be closed. The client itself is
+	//never closed on purpose: the connection manager can come from an outside factory, and
+	//HttpClientBuilder adds that manager's shutdown to the client's own closeable resources
+	//unless it is marked shared — so closing the client here would stop a manager that other
+	//connections are still using. Nothing leaks by leaving it open: NoConnectionReuseStrategy
+	//means no socket is ever parked in the manager to begin with.
 	private CloseableHttpClient client;
 
 	private URL url;
@@ -896,8 +903,10 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * that decision identical to the one taken on the entity this replaces.
 	 * <p>
 	 * The two figures only ever differ for a chunked body, which frames no length at all: a declared
-	 * length that the body then falls short of never reaches here, because closing such a stream
-	 * early raises ConnectionClosedException and the exchange lands on {@link FailedBody} instead.
+	 * length that the body then falls short of never reaches here, because reading such a body to
+	 * its end raises ConnectionClosedException, which lands the exchange on {@link FailedBody}
+	 * instead. Nothing on this path closes a body early — the one close is of a body already read
+	 * whole — and nothing should start to: that close is what makes the release deterministic.
 	 */
 	private static final class BufferedBody extends ByteArrayEntity {
 		private final long framedLength;
