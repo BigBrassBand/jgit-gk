@@ -64,8 +64,14 @@ public class B3HttpClientConnectionFactory implements HttpConnectionFactory {
 	 * <p>
 	 * The buffer is held per exchange in flight, and a chunked body reaches the limit by doubling,
 	 * so peak heap is a small multiple of this figure times the number of concurrent requests.
+	 * <p>
+	 * 200 KiB is about twice the largest unread body measured in production — and the figure to
+	 * compare against is a wire measurement, because this limit counts bytes as they arrived
+	 * rather than decompressed. Raising it is the answer to a non-zero stream_unread count, not
+	 * something to do in advance: a body past the limit is paid for by every pack fetch, which
+	 * always exceeds it and holds the prefix for the whole fetch.
 	 */
-	public static final int DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 1024 * 1024;
+	public static final int DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 200 * 1024;
 
 	/**
 	 * HttpClientConnectionManagerFactory
