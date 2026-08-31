@@ -125,7 +125,42 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_POST;
 import static org.eclipse.jgit.util.HttpSupport.METHOD_PUT;
 
 /**
- * A {@link HttpConnection} which uses {@link HttpClient}
+ * A {@link HttpConnection} which uses {@link HttpClient}.
+ * <p>
+ * The JGit interface implemented here declares neither {@code close} nor {@code disconnect}, so
+ * no caller can end an exchange and releasing the socket is this class's own business. That is
+ * what most of the file is, spread over five nested classes:
+ * <ul>
+ * <li>{@code Exchange} holds the state of one exchange and renders the single verdict the
+ * counters are told about. It is deliberately reachable from neither the connection nor the body
+ * stream.
+ * <li>{@code ResponseBodyDrain} is a response interceptor registered first, so it sees bytes as
+ * they came off the wire rather than decompressed. It reads a body that fits the limit and gets
+ * the socket back before the caller sees the response at all. It runs only when a finite read
+ * timeout is set, because nothing else would bound how long it takes.
+ * <li>{@code BufferedBody} and {@code FailedBody} are the replacement entities it installs, for
+ * a body that arrived whole and for one that broke in mid-flight.
+ * <li>{@code TrackedBodyStream} wraps a body handed to the caller and tells the exchange when
+ * that body reaches its end or is closed.
+ * </ul>
+ * <p>
+ * <b>Three places can render the verdict, and one would not do.</b> {@code TransportHttp} drops
+ * the connection object as soon as it holds the body stream, so on every fetch bigger than the
+ * limit this object becomes unreachable while its body is still being read. A single cleanup
+ * action on the connection would therefore count each real pack fetch as abandoned. Instead the
+ * exchange is settled by whichever comes first: the exec chain returning, for a body already
+ * buffered; the body stream reaching its end or being closed; or collection — of the connection,
+ * or of the stream, two cleaners with the connection's deferring to the stream's while a body is
+ * out. A compare-and-set inside {@code Exchange} keeps that to one verdict per connection, so a
+ * redirect chain that released four sockets still reports once.
+ * <p>
+ * <b>No cleanup action may reach what it watches.</b> An action able to reach this connection
+ * would keep it alive for good, turning the socket leak into a memory leak, so every registered
+ * action is a bound method reference on {@code Exchange} — which holds nothing but the
+ * {@link Closeable} response. The same constraint read the other way is why
+ * {@link Reference#reachabilityFence} appears in {@link #getInputStream()} and in
+ * {@code TrackedBodyStream}: without it a cleaner may run while the method it belongs to is
+ * still deciding, and close the socket under a stream about to be returned or still being read.
  *
  * @since 3.3
  */
