@@ -688,6 +688,11 @@ public class B3HttpClientConnection implements HttpConnection {
 		//the caller reached the end of a taken body or closed it, which ends the exchange for good:
 		//no further hop can follow, so the verdict need not wait for collection
 		void bodyFinished() {
+			//the stream underneath releases the connection on its own — except under
+			//decompression, where GZIPInputStream reports its own end after its trailer and only
+			//consults the stream below it while available() > 0, which on a socket it is not. So
+			//the end of a decompressed body would otherwise record a release nobody performed.
+			closeQuietly(response);
 			state.set(State.RELEASED);
 			account();
 		}
@@ -727,24 +732,30 @@ public class B3HttpClientConnection implements HttpConnection {
 
 		//one verdict per connection, so that init roughly equals close + abandoned for a metrics
 		//reader; a redirect chain releases several sockets under one connection and must not report
-		//a release for each
+		//a release for each.
+		//Guarding the closing with that same compare-and-set would mean that after the first
+		//verdict no socket could ever be closed again — and a second exchange on this
+		//connection still has one to give back. Closing an already-released holder is a
+		//no-op, so doing it every time costs nothing.
 		private void account() {
+			State current = state.get();
+			if (current == State.BODY_ON_SOCKET || current == State.BODY_TAKEN) {
+				closeQuietly(response);
+			}
 			if (!accounted.compareAndSet(false, true)) {
 				return;
 			}
-			switch (state.get()) {
+			switch (current) {
 			case RELEASED:
 				closeCount.incrementAndGet();
 				break;
 			case BODY_ON_SOCKET:
 				abandonedCount.incrementAndGet();
 				streamedUnreadCount.incrementAndGet();
-				closeQuietly(response);
 				break;
 			case BODY_TAKEN:
 				abandonedCount.incrementAndGet();
 				streamAbandonedCount.incrementAndGet();
-				closeQuietly(response);
 				break;
 			default:
 				//NOT_STARTED: no request was ever issued, so there is nothing to report
