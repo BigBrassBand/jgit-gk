@@ -96,6 +96,7 @@ import java.io.Closeable;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.io.SequenceInputStream;
 import java.lang.ref.Cleaner;
@@ -129,17 +130,18 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_PUT;
  * <p>
  * The JGit interface implemented here declares neither {@code close} nor {@code disconnect}, so
  * no caller can end an exchange and releasing the socket is this class's own business. That is
- * what most of the file is, spread over five nested classes:
+ * what most of the file is, spread over the nested types below:
  * <ul>
  * <li>{@code Exchange} holds the state of one exchange and renders the single verdict the
- * counters are told about. It is deliberately reachable from neither the connection nor the body
- * stream.
+ * counters are told about. It deliberately reaches neither the connection nor the body stream,
+ * which is what lets a cleaner hold it.
  * <li>{@code ResponseBodyDrain} is a response interceptor registered first, so it sees bytes as
  * they came off the wire rather than decompressed. It reads a body that fits the limit and gets
  * the socket back before the caller sees the response at all. It runs only when a finite read
  * timeout is set, because nothing else would bound how long it takes.
  * <li>{@code BufferedBody} and {@code FailedBody} are the replacement entities it installs, for
- * a body that arrived whole and for one that broke in mid-flight.
+ * a body that arrived whole and for one nobody can be handed — broken in mid-flight, or still
+ * arriving when the budget ran out.
  * <li>{@code TrackedBodyStream} wraps a body handed to the caller and tells the exchange when
  * that body reaches its end or is closed.
  * </ul>
@@ -244,26 +246,36 @@ public class B3HttpClientConnection implements HttpConnection {
 	 *         underlying totals agree over time — but three separate reads are not one snapshot, and
 	 *         a cleanup landing between them moves an increment into the next window.
 	 *         <p>
-	 *         Nor does it pair off exactly against {@link #getInitCount()}. Three kinds of
+	 *         Nor does it pair off exactly against {@link #getInitCount()}. Four kinds of
 	 *         connection count as an init and then report nothing: one whose URL fails to parse,
-	 *         one simply constructed and dropped, and one built around a caller-supplied
+	 *         one simply constructed and dropped, one built around a caller-supplied
 	 *         {@code CloseableHttpClient}, which carries none of the interceptor this bookkeeping
-	 *         rides on and so goes unreported even though it did issue a request. A small residual
-	 *         is expected and is not a leak.
+	 *         rides on and so goes unreported even though it did issue a request, and one whose
+	 *         request never came back with a response at all — connection refused, DNS or TLS
+	 *         failure, a timeout on the status line — which leaves the exchange where it
+	 *         started and reports nothing when collected. None of the four left a socket open, so
+	 *         the residual is not a leak; but the last of them grows with the failure rate, so
+	 *         against an unreachable host it is not small either.
 	 */
 	public static long getAbandonedCount() {
 		return abandonedCount.getAndSet(0L);
 	}
 
 	/**
-	 * @return number of responses whose body was too big to buffer and was then never read at all,
-	 *         since last call (resets counter).
+	 * @return number of responses whose body was left on the socket and was then never read at
+	 *         all, since last call (resets counter).
 	 *         <p>
-	 *         Do not read this as "the limit is too low" on its own — that is only one of its
-	 *         causes. A caller is also entitled to walk away from a big body it never wanted:
-	 *         jgit's {@code TransportHttp} throws on any non-200 without reading a byte, so a
-	 *         large error page lands here having cost nothing. Raise the limit only once the
-	 *         bodies behind the count are known to be ones somebody meant to read.
+	 *         Two things leave a body there, and only one of them is answered by the limit. Either
+	 *         the body outgrew the limit, or no finite read timeout was set and so the drain never
+	 *         ran at all — jgit passes a read timeout of zero when the repository configures none,
+	 *         and zero means "wait forever" to a socket, which is no budget to read a body the
+	 *         caller has not asked for. Where that is the cause, raising the limit does nothing.
+	 *         <p>
+	 *         Even for the first cause, do not read this as "the limit is too low" on its own. A
+	 *         caller is entitled to walk away from a big body it never wanted: jgit's
+	 *         {@code TransportHttp} throws on any non-200 without reading a byte, so a large error
+	 *         page lands here having cost nothing. Raise the limit only once the bodies behind the
+	 *         count are known to be ones somebody meant to read.
 	 */
 	public static long getStreamedUnreadCount() {
 		return streamedUnreadCount.getAndSet(0L);
@@ -273,6 +285,18 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * @return number of response streams that were handed to a caller and dropped before their end,
 	 *         since last call (resets counter). Independent of the buffering limit: the caller took
 	 *         the body and neither finished nor closed it.
+	 */
+	/**
+	 * @return number of bodies handed to a caller and then let go before their end, since last call
+	 *         (resets counter).
+	 *         <p>
+	 *         "Let go" is as much as this can tell. A caller walking away from a body it no longer
+	 *         wants and a body breaking in mid-flight and being dropped where it broke are one
+	 *         event here: in both the stream stopped short of its end and was collected rather
+	 *         than closed. The socket was released either way, so this is a limit on how precisely
+	 *         the count describes what happened, not a claim that anything leaked — but it does
+	 *         mean a spell of torn connections raises this count, and {@link #getAbandonedCount()}
+	 *         with it, while every caller behaved.
 	 */
 	public static long getStreamAbandonedCount() {
 		return streamAbandonedCount.getAndSet(0L);
@@ -718,9 +742,11 @@ public class B3HttpClientConnection implements HttpConnection {
 			state.set(State.RELEASED);
 		}
 
+		//BODY_TAKEN is deliberately not included: a second getInputStream() would otherwise
+		//build a second stream over the same socket and register a second cleaner, and collecting
+		//that one closes the response under the first stream while the caller is still reading it.
 		boolean isBodyOnSocket() {
-			State current = state.get();
-			return current == State.BODY_ON_SOCKET || current == State.BODY_TAKEN;
+			return state.get() == State.BODY_ON_SOCKET;
 		}
 
 		void bodyTaken() {
@@ -854,8 +880,9 @@ public class B3HttpClientConnection implements HttpConnection {
 			ByteArrayOutputStream head = newBuffer(framedLength);
 			try {
 				InputStream in = body.getContent();
-				if (readWithinLimit(in, head, maxBufferedBytes,
+				switch (drain(in, head, maxBufferedBytes,
 						System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMillis))) {
+				case COMPLETE:
 					response.setEntity(withMetadataOf(body,
 							new BufferedBody(head.toByteArray(), framedLength)));
 					closeQuietly(in);
@@ -864,11 +891,27 @@ public class B3HttpClientConnection implements HttpConnection {
 					//reuse strategy — kept so the branch does not lean on Apache's release ordering
 					closeQuietly(closeable);
 					exchange.bodyReleased(closeable);
-				} else {
-					InputStream whole = new SequenceInputStream(
-							new ByteArrayInputStream(head.toByteArray()), in);
-					response.setEntity(withMetadataOf(body,
-							new InputStreamEntity(whole, framedLength)));
+					break;
+				case OVER_LIMIT:
+					//the one branch that does not release: the stream does, when the caller reaches
+					//its end or closes it
+					response.setEntity(withMetadataOf(body, new InputStreamEntity(
+							new SequenceInputStream(
+									new ByteArrayInputStream(head.toByteArray()), in),
+							framedLength)));
+					break;
+				case OUT_OF_BUDGET:
+				default:
+					//handing this one back would leave release to a caller under no obligation to
+					//read it — TransportHttp throws on any non-200 without touching a body — and so
+					//to a collection, which is the wait this class exists to end. Failing it
+					//releases now, and says so where a body that stopped early would not
+					response.setEntity(withMetadataOf(body, new FailedBody(head.toByteArray(),
+							outOfBudget(head.size()), framedLength)));
+					closeQuietly(in);
+					closeQuietly(closeable);
+					exchange.bodyReleased(closeable);
+					break;
 				}
 			} catch (IOException e) {
 				//a broken body used to surface when the caller read it, and still should; hand on
@@ -896,27 +939,48 @@ public class B3HttpClientConnection implements HttpConnection {
 			return new ByteArrayOutputStream();
 		}
 
-		//true when the body ended within limit bytes, all of it now in head; false when it did not,
-		//head then holding what had arrived by then — the first limit + 1 bytes of it, or less if
-		//the deadline came first. Giving up on the deadline costs nothing but the buffering: the
-		//caller is handed the prefix plus the rest of the socket either way.
-		private static boolean readWithinLimit(InputStream in, ByteArrayOutputStream head, int limit,
+		//how the drain stopped. Not a boolean, because running out of budget and outgrowing the
+		//limit are not the same event: the second hands a body on to a caller who asked for it,
+		//the first has nobody to hand it to and no reason to keep waiting.
+		private enum DrainOutcome {
+			//the body ended within limit bytes, all of it now in head
+			COMPLETE,
+			//it outgrew the limit, head holding the first limit + 1 bytes of it
+			OVER_LIMIT,
+			//the budget ran out with the body still arriving, head holding what got here
+			OUT_OF_BUDGET
+		}
+
+		//the deadline is only tested between reads, so the last read can still take a whole socket
+		//timeout past it. That slack is why the budget is counted in read timeouts rather than set
+		//as one: bounding the read itself would mean handing setSocketTimeout a shrinking value,
+		//and zero there means "wait forever", not "give up now".
+		private static DrainOutcome drain(InputStream in, ByteArrayOutputStream head, int limit,
 			long deadlineNanos) throws IOException {
 			byte[] chunk = new byte[8192];
 			long read = 0;
 			while (read <= limit) {
 				//subtraction, not comparison: it stays correct across a nanoTime wrap
 				if (System.nanoTime() - deadlineNanos >= 0) {
-					return false;
+					return DrainOutcome.OUT_OF_BUDGET;
 				}
 				int n = in.read(chunk, 0, (int) Math.min(chunk.length, limit + 1L - read));
 				if (n < 0) {
-					return true;
+					return DrainOutcome.COMPLETE;
 				}
 				head.write(chunk, 0, n);
 				read += n;
 			}
-			return false;
+			return DrainOutcome.OVER_LIMIT;
+		}
+
+		//an InterruptedIOException rather than a SocketTimeoutException: no socket timed out, the
+		//budget did, and bytesTransferred is the one field able to say how far the body got
+		private static InterruptedIOException outOfBudget(int received) {
+			InterruptedIOException failure = new InterruptedIOException(
+					"response body still arriving when the drain budget ran out"); //$NON-NLS-1$
+			failure.bytesTransferred = received;
+			return failure;
 		}
 
 		//the replacement has to carry the original Content-Type and Content-Encoding, so that

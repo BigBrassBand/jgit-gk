@@ -67,9 +67,13 @@ public class B3HttpClientConnectionFactory implements HttpConnectionFactory {
 	 * <p>
 	 * 200 KiB is about twice the largest unread body measured in production — and the figure to
 	 * compare against is a wire measurement, because this limit counts bytes as they arrived
-	 * rather than decompressed. Raising it is the answer to a non-zero stream_unread count, not
-	 * something to do in advance: a body past the limit is paid for by every pack fetch, which
-	 * always exceeds it and holds the prefix for the whole fetch.
+	 * rather than decompressed. Raising it is not something to do in advance: a body past the
+	 * limit is paid for by every pack fetch, which always exceeds it and holds the prefix for the
+	 * whole fetch.
+	 * <p>
+	 * It answers a non-zero stream_unread count only where the bodies behind that count outgrew
+	 * the limit. The same count also rises when no finite read timeout is set, because the drain
+	 * does not run at all without one — and there the limit is not the lever.
 	 */
 	public static final int DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 200 * 1024;
 
