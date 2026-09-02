@@ -799,11 +799,13 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * A 200 is left alone entirely: that body is the one the caller asked for, and the caller's
 	 * own reading is what releases its socket.
 	 * <p>
-	 * So is a body framed as zero bytes, whatever its status. httpcore gives such a response
-	 * {@code EmptyInputStream.INSTANCE} (BHttpConnectionBase:210-211), which
-	 * {@code BasicHttpEntity.isStreaming} reports as not streaming, so nothing is bound to the
-	 * socket and the exec chain has released it already. The caller then gets the real body, empty
-	 * and whole — there is nothing here to discard.
+	 * So is a body framed as zero bytes, whatever its status, and by a route worth naming because a
+	 * dependency bump can take it away. Since httpcore 4.4, {@code BHttpConnectionBase
+	 * .createInputStream} answers a declared length of zero with {@code EmptyInputStream.INSTANCE}
+	 * rather than an empty {@code ContentLengthInputStream}, and {@code BasicHttpEntity.isStreaming}
+	 * singles that instance out as not streaming. So {@code ResponseEntityProxy.enchance} never
+	 * wraps it, no connection holder is attached, and the exec chain has already released the
+	 * socket. The caller then gets the real body — empty and whole, with nothing here to discard.
 	 * <p>
 	 * Runs once per hop, so a redirect chain resolved inside httpclient reaches it for every
 	 * response in the chain: the 3xx hops are closed here, the final 200 is not. That is the same
