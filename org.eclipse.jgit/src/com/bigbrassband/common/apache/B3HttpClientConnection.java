@@ -46,11 +46,11 @@ import com.bigbrassband.common.apache.internal.HttpApacheText;
 import org.apache.http.Header;
 import org.apache.http.HttpEntity;
 import org.apache.http.HttpEntityEnclosingRequest;
-import org.apache.http.HttpException;
 import org.apache.http.HttpHeaders;
 import org.apache.http.HttpHost;
 import org.apache.http.HttpResponse;
 import org.apache.http.HttpResponseInterceptor;
+import org.apache.http.HttpStatus;
 import org.apache.http.client.ClientProtocolException;
 import org.apache.http.client.CredentialsProvider;
 import org.apache.http.client.HttpClient;
@@ -70,8 +70,6 @@ import org.apache.http.conn.socket.PlainConnectionSocketFactory;
 import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
 import org.apache.http.conn.ssl.X509HostnameVerifier;
 import org.apache.http.entity.AbstractHttpEntity;
-import org.apache.http.entity.ByteArrayEntity;
-import org.apache.http.entity.InputStreamEntity;
 import org.apache.http.impl.NoConnectionReuseStrategy;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClientBuilder;
@@ -90,18 +88,13 @@ import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLSession;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManager;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InterruptedIOException;
 import java.io.OutputStream;
-import java.io.SequenceInputStream;
 import java.lang.ref.Cleaner;
 import java.lang.ref.Reference;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -135,23 +128,21 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_PUT;
  * <li>{@code Exchange} holds the state of one exchange and renders the single verdict the
  * counters are told about. It deliberately reaches neither the connection nor the body stream,
  * which is what lets a cleaner hold it.
- * <li>{@code ResponseBodyDrain} is a response interceptor registered first, so it sees bytes as
- * they came off the wire rather than decompressed. It reads a body that fits the limit and gets
- * the socket back before the caller sees the response at all. It runs only when a finite read
- * timeout is set, because nothing else would bound how long it takes.
- * <li>{@code BufferedBody} and {@code FailedBody} are the replacement entities it installs, for
- * a body that arrived whole and for one nobody can be handed — broken in mid-flight, or still
- * arriving when the budget ran out.
+ * <li>{@code NonOkBodyCloser} is a response interceptor that closes the connection of every
+ * response other than 200, before the caller sees it. Nothing reads such a body, so nothing is
+ * read off the wire first — the socket comes back at once.
+ * <li>{@code DiscardedBody} is the replacement entity it installs, so that a caller which does
+ * ask for one of those bodies is told it is gone rather than handed an empty one.
  * <li>{@code TrackedBodyStream} wraps a body handed to the caller and tells the exchange when
  * that body reaches its end or is closed.
  * </ul>
  * <p>
  * <b>Three places can render the verdict, and one would not do.</b> {@code TransportHttp} drops
- * the connection object as soon as it holds the body stream, so on every fetch bigger than the
- * limit this object becomes unreachable while its body is still being read. A single cleanup
- * action on the connection would therefore count each real pack fetch as abandoned. Instead the
- * exchange is settled by whichever comes first: the exec chain returning, for a body already
- * buffered; the body stream reaching its end or being closed; or collection — of the connection,
+ * the connection object as soon as it holds the body stream, so on every fetch this object
+ * becomes unreachable while its body is still being read. A single cleanup action on the
+ * connection would therefore count each real pack fetch as abandoned. Instead the exchange is
+ * settled by whichever comes first: the exec chain returning, for a response already closed
+ * unread; the body stream reaching its end or being closed; or collection — of the connection,
  * or of the stream, two cleaners with the connection's deferring to the stream's while a body is
  * out. A compare-and-set inside {@code Exchange} keeps that to one verdict per connection, so a
  * redirect chain that released four sockets still reports once.
@@ -168,9 +159,6 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_PUT;
  */
 public class B3HttpClientConnection implements HttpConnection {
 	private static final Cleaner CLEANER = Cleaner.create();
-	//the socket timeout bounds one read, not the whole drain: read() returns as soon as any
-	//byte arrives, so a server sending one at a time is bounded only by the limit in bytes.
-	private static final int DRAIN_BUDGET_READ_TIMEOUTS = 5;
 	private static final AtomicLong initCount = new AtomicLong(0);
 	private static final AtomicLong closeCount = new AtomicLong(0);
 	private static final AtomicLong abandonedCount = new AtomicLong(0);
@@ -178,7 +166,6 @@ public class B3HttpClientConnection implements HttpConnection {
 	private static final AtomicLong streamAbandonedCount = new AtomicLong(0);
 
 	private final B3HttpClientConnectionFactory.HttpClientConnectionManagerFactory httpClientConnectionManagerFactory;
-	private final int maxBufferedResponseBytes;
 	private final Exchange exchange = new Exchange();
 	//CloseableHttpClient rather than HttpClient because only its execute() returns a
 	//CloseableHttpResponse, and the response is what has to be closed. The client itself is
@@ -233,7 +220,9 @@ public class B3HttpClientConnection implements HttpConnection {
 	}
 
 	/**
-	 * @return number of exchanges that released their connection since last call (resets counter)
+	 * @return number of exchanges that released their connection since last call (resets counter).
+	 *         Both ways of releasing land here and are not told apart: a body the caller read to
+	 *         its end, and a response other than 200 whose connection was closed unread.
 	 */
 	public static long getCloseCount() {
 		return closeCount.getAndSet(0L);
@@ -265,27 +254,16 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * @return number of responses whose body was left on the socket and was then never read at
 	 *         all, since last call (resets counter).
 	 *         <p>
-	 *         Two things leave a body there, and only one of them is answered by the limit. Either
-	 *         the body outgrew the limit, or no finite read timeout was set and so the drain never
-	 *         ran at all — jgit passes a read timeout of zero when the repository configures none,
-	 *         and zero means "wait forever" to a socket, which is no budget to read a body the
-	 *         caller has not asked for. Where that is the cause, raising the limit does nothing.
-	 *         <p>
-	 *         Even for the first cause, do not read this as "the limit is too low" on its own. A
-	 *         caller is entitled to walk away from a big body it never wanted: jgit's
-	 *         {@code TransportHttp} throws on any non-200 without reading a byte, so a large error
-	 *         page lands here having cost nothing. Raise the limit only once the bodies behind the
-	 *         count are known to be ones somebody meant to read.
+	 *         Only a 200 can land here: every other status has its connection closed before the
+	 *         caller sees the response. So a body counted here is one the caller asked for and
+	 *         walked away from without reading — which no setting answers, and which nothing in
+	 *         jgit's {@code TransportHttp} does today. A non-zero count names a caller to look at,
+	 *         not a number to change.
 	 */
 	public static long getStreamedUnreadCount() {
 		return streamedUnreadCount.getAndSet(0L);
 	}
 
-	/**
-	 * @return number of response streams that were handed to a caller and dropped before their end,
-	 *         since last call (resets counter). Independent of the buffering limit: the caller took
-	 *         the body and neither finished nor closed it.
-	 */
 	/**
 	 * @return number of bodies handed to a caller and then let go before their end, since last call
 	 *         (resets counter).
@@ -306,10 +284,9 @@ public class B3HttpClientConnection implements HttpConnection {
 		if (client == null) {
 			HttpClientBuilder clientBuilder = HttpClients.custom();
 			clientBuilder.setConnectionReuseStrategy(NoConnectionReuseStrategy.INSTANCE);
-			//first, so it runs ahead of ResponseContentEncoding and the limit then counts bytes off
-			//the wire rather than decompressed bytes
-			clientBuilder.addInterceptorFirst(new ResponseBodyDrain(exchange, maxBufferedResponseBytes,
-					drainBudgetMillis()));
+			//first, so the entity it replaces is the one that came off the wire rather than the
+			//decompressing wrapper ResponseContentEncoding puts around it
+			clientBuilder.addInterceptorFirst(new NonOkBodyCloser(exchange));
 			if(httpClientConnectionManagerFactory!=null)
 				clientBuilder.setConnectionManager(httpClientConnectionManagerFactory.getConnectionManager());
 			RequestConfig.Builder configBuilder = RequestConfig.custom();
@@ -350,16 +327,6 @@ public class B3HttpClientConnection implements HttpConnection {
 		return client;
 	}
 
-	//zero means the drain does not run. A read timeout of zero reaches setSocketTimeout as
-	//"wait forever", and jgit passes exactly that when the repository configures no timeout
-	//(RemoteConfig reads KEY_TIMEOUT with a default of 0), so a single read need never return.
-	private long drainBudgetMillis() {
-		if (readTimeoutMilliseconds == null || readTimeoutMilliseconds <= 0) {
-			return 0L;
-		}
-		return (long) readTimeoutMilliseconds * DRAIN_BUDGET_READ_TIMEOUTS;
-	}
-
 	private SSLContext getSSLContext() {
 		if (ctx == null) {
 			try {
@@ -386,11 +353,10 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * @param urlStr urlStr
 	 * @param connectTimeoutSeconds connectTimeoutSeconds
 	 * @param httpClientConnectionManagerFactory httpClientConnectionManagerFactory
-	 * @param maxBufferedResponseBytes maxBufferedResponseBytes
 	 * @throws MalformedURLException MalformedURLException
 	 */
-	public B3HttpClientConnection(String urlStr, int connectTimeoutSeconds, B3HttpClientConnectionFactory.HttpClientConnectionManagerFactory httpClientConnectionManagerFactory, int maxBufferedResponseBytes) throws MalformedURLException {
-		this(urlStr, connectTimeoutSeconds, null, httpClientConnectionManagerFactory, maxBufferedResponseBytes);
+	public B3HttpClientConnection(String urlStr, int connectTimeoutSeconds, B3HttpClientConnectionFactory.HttpClientConnectionManagerFactory httpClientConnectionManagerFactory) throws MalformedURLException {
+		this(urlStr, connectTimeoutSeconds, null, httpClientConnectionManagerFactory);
 	}
 
 	/**
@@ -399,12 +365,11 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * @param connectTimeoutSeconds connectTimeoutSeconds
 	 * @param proxy proxy
 	 * @param httpClientConnectionManagerFactory httpClientConnectionManagerFactory
-	 * @param maxBufferedResponseBytes maxBufferedResponseBytes
 	 * @throws MalformedURLException MalformedURLException
 	 */
-	public B3HttpClientConnection(String urlStr, int connectTimeoutSeconds, Proxy proxy, B3HttpClientConnectionFactory.HttpClientConnectionManagerFactory httpClientConnectionManagerFactory, int maxBufferedResponseBytes)
+	public B3HttpClientConnection(String urlStr, int connectTimeoutSeconds, Proxy proxy, B3HttpClientConnectionFactory.HttpClientConnectionManagerFactory httpClientConnectionManagerFactory)
 			throws MalformedURLException {
-		this(urlStr, connectTimeoutSeconds, proxy, null, httpClientConnectionManagerFactory, maxBufferedResponseBytes);
+		this(urlStr, connectTimeoutSeconds, proxy, null, httpClientConnectionManagerFactory);
 	}
 
 	/**
@@ -414,19 +379,10 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * @param proxy proxy
 	 * @param cl cl
 	 * @param httpClientConnectionManagerFactory httpClientConnectionManagerFactory
-	 * @param maxBufferedResponseBytes largest response body read into memory so that the connection
-	 *            can be released before the caller sees the response; bigger bodies keep streaming.
-	 *            Must be positive. Ignored when {@code cl} is supplied, since the buffering rides on
-	 *            an interceptor of the client this class builds itself.
 	 * @throws MalformedURLException MalformedURLException
-	 * @throws IllegalArgumentException if maxBufferedResponseBytes is not positive
 	 */
-	public B3HttpClientConnection(String urlStr, int connectTimeoutSeconds, Proxy proxy, CloseableHttpClient cl, B3HttpClientConnectionFactory.HttpClientConnectionManagerFactory httpClientConnectionManagerFactory, int maxBufferedResponseBytes)
+	public B3HttpClientConnection(String urlStr, int connectTimeoutSeconds, Proxy proxy, CloseableHttpClient cl, B3HttpClientConnectionFactory.HttpClientConnectionManagerFactory httpClientConnectionManagerFactory)
 			throws MalformedURLException {
-		if (maxBufferedResponseBytes <= 0) {
-			throw new IllegalArgumentException("maxBufferedResponseBytes must be positive: " //$NON-NLS-1$
-					+ maxBufferedResponseBytes);
-		}
 		initCount.incrementAndGet();
 		Exchange onCollection = this.exchange;
 		//a cleanup action able to reach this connection would keep it alive for good, turning the
@@ -436,7 +392,6 @@ public class B3HttpClientConnection implements HttpConnection {
 		this.url = new URL(urlStr);
 		this.proxy = proxy;
 		this.httpClientConnectionManagerFactory=httpClientConnectionManagerFactory;
-		this.maxBufferedResponseBytes=maxBufferedResponseBytes;
 
 		//if the caller passed in connect timeout seconds --- then don't let
 		//jgit come along and change it later
@@ -485,8 +440,8 @@ public class B3HttpClientConnection implements HttpConnection {
 			resp = getClient().execute(req,context);
 		} finally {
 			//a null resp is the only sign of a failed chain available here, and the exchange has to
-			//be told either way: an over-budget body drained just before the throw would otherwise
-			//be left looking like a body still on the socket, i.e. reported as abandoned
+			//be told either way: a hop closed unread just before the throw would otherwise be left
+			//looking like a body still on the socket, i.e. reported as abandoned
 			if (resp == null) {
 				exchange.exchangeFailed();
 			} else {
@@ -765,8 +720,8 @@ public class B3HttpClientConnection implements HttpConnection {
 			account();
 		}
 
-		//the exec chain has returned, so no further hop can revise the verdict; a body already
-		//buffered and released is counted here rather than waiting to be collected
+		//the exec chain has returned, so no further hop can revise the verdict; a response already
+		//closed unread is counted here rather than waiting to be collected
 		void exchangeSettled() {
 			if (state.get() == State.RELEASED) {
 				account();
@@ -833,33 +788,31 @@ public class B3HttpClientConnection implements HttpConnection {
 	}
 
 	/**
-	 * Reads a response body small enough to buffer and releases the connection before the caller ever
-	 * sees the response. Bigger bodies are put back together from the bytes already read plus the
-	 * rest of the socket, and keep releasing the way they do without this interceptor: when the caller
-	 * reaches the end of the stream or closes it.
+	 * Closes the connection of any response other than 200, before the caller sees it.
 	 * <p>
-	 * Runs once per hop, so a redirect chain resolved inside httpclient reaches it for every response
-	 * in the chain and the exchange state moves back and forth accordingly.
+	 * Nothing reads such a body. jgit's {@code TransportHttp} throws on the status line — from
+	 * {@code openResponse} on every service call, and from each {@code case} of {@code connect}
+	 * that is not {@code HTTP_OK} — and builds its message out of the status line rather than the
+	 * body. So there is nothing here to preserve, and reading the body off the wire first would
+	 * only make the caller wait for bytes on their way to being discarded.
 	 * <p>
-	 * Does not run at all without a finite read timeout to derive a budget from, since reading a
-	 * body the caller has not asked for must never be what blocks the caller forever.
+	 * A 200 is left alone entirely: that body is the one the caller asked for, and the caller's
+	 * own reading is what releases its socket.
+	 * <p>
+	 * Runs once per hop, so a redirect chain resolved inside httpclient reaches it for every
+	 * response in the chain: the 3xx hops are closed here, the final 200 is not. That is the same
+	 * socket-per-hop count as without this interceptor, since httpclient leases again for each hop
+	 * and NoConnectionReuseStrategy closes every socket regardless.
 	 */
-	private static final class ResponseBodyDrain implements HttpResponseInterceptor {
+	private static final class NonOkBodyCloser implements HttpResponseInterceptor {
 		private final Exchange exchange;
 
-		private final int maxBufferedBytes;
-
-		private final long budgetMillis;
-
-		ResponseBodyDrain(Exchange exchange, int maxBufferedBytes, long budgetMillis) {
+		NonOkBodyCloser(Exchange exchange) {
 			this.exchange = exchange;
-			this.maxBufferedBytes = maxBufferedBytes;
-			this.budgetMillis = budgetMillis;
 		}
 
 		@Override
-		public void process(HttpResponse response, HttpContext context)
-				throws HttpException, IOException {
+		public void process(HttpResponse response, HttpContext context) {
 			Closeable closeable = (response instanceof Closeable) ? (Closeable) response : null;
 			//nothing that can throw may precede this: an Error out of this method is not one
 			//ProtocolExec closes the response for, and the record is what leaves a cleaner able to.
@@ -871,121 +824,24 @@ public class B3HttpClientConnection implements HttpConnection {
 				exchange.bodyReleased(closeable);
 				return;
 			}
-			if (budgetMillis <= 0) {
-				//nothing to mark: the state already says the body is on the socket, and
-				//streamedUnreadCount reports it if the caller then walks away from it
+			if (response.getStatusLine().getStatusCode() == HttpStatus.SC_OK) {
 				return;
 			}
-			long framedLength = body.getContentLength();
-			ByteArrayOutputStream head = newBuffer(framedLength);
-			try {
-				InputStream in = body.getContent();
-				switch (drain(in, head, maxBufferedBytes,
-						System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMillis))) {
-				case COMPLETE:
-					response.setEntity(withMetadataOf(body,
-							new BufferedBody(head.toByteArray(), framedLength)));
-					closeQuietly(in);
-					//that EOF already released the holder (ResponseEntityProxy.eofDetected), and
-					//ConnectionHolder's release is CAS-guarded, so this close is a no-op whatever the
-					//reuse strategy — kept so the branch does not lean on Apache's release ordering
-					closeQuietly(closeable);
-					exchange.bodyReleased(closeable);
-					break;
-				case OVER_LIMIT:
-					//the one branch that does not release: the stream does, when the caller reaches
-					//its end or closes it
-					response.setEntity(withMetadataOf(body, new InputStreamEntity(
-							new SequenceInputStream(
-									new ByteArrayInputStream(head.toByteArray()), in),
-							framedLength)));
-					break;
-				case OUT_OF_BUDGET:
-				default:
-					//handing this one back would leave release to a caller under no obligation to
-					//read it — TransportHttp throws on any non-200 without touching a body — and so
-					//to a collection, which is the wait this class exists to end. Failing it
-					//releases now, and says so where a body that stopped early would not
-					response.setEntity(withMetadataOf(body, new FailedBody(head.toByteArray(),
-							outOfBudget(head.size()), framedLength)));
-					closeQuietly(in);
-					closeQuietly(closeable);
-					exchange.bodyReleased(closeable);
-					break;
-				}
-			} catch (IOException e) {
-				//a broken body used to surface when the caller read it, and still should; hand on
-				//both what did arrive and the failure that stopped it
-				response.setEntity(withMetadataOf(body,
-						new FailedBody(head.toByteArray(), e, framedLength)));
-				//unlike its twin above, this close can be the only one there is. Swallowing the
-				//failure is what makes it so: ProtocolExec never sees the exception and so never
-				//closes the response, and a getContent() that threw before any EofSensorInputStream
-				//existed left nothing else holding the socket either
-				closeQuietly(closeable);
-				exchange.bodyReleased(closeable);
-			}
-		}
-
-		//a declared length is only ever allocated when it fits the limit: the number comes off the
-		//wire, so sizing a buffer to a claimed 2 GB would hand a remote server an OutOfMemoryError
-		//to fire at will, and the (int) cast below is only sound inside that range — a larger claim
-		//truncates or turns negative. Past the limit, and for a chunked body with no length at all,
-		//the buffer grows by doubling instead — which is what makes peak heap a multiple of the limit.
-		private ByteArrayOutputStream newBuffer(long framedLength) {
-			if (framedLength > 0 && framedLength <= maxBufferedBytes) {
-				return new ByteArrayOutputStream((int) framedLength);
-			}
-			return new ByteArrayOutputStream();
-		}
-
-		//how the drain stopped. Not a boolean, because running out of budget and outgrowing the
-		//limit are not the same event: the second hands a body on to a caller who asked for it,
-		//the first has nobody to hand it to and no reason to keep waiting.
-		private enum DrainOutcome {
-			//the body ended within limit bytes, all of it now in head
-			COMPLETE,
-			//it outgrew the limit, head holding the first limit + 1 bytes of it
-			OVER_LIMIT,
-			//the budget ran out with the body still arriving, head holding what got here
-			OUT_OF_BUDGET
-		}
-
-		//the deadline is only tested between reads, so the last read can still take a whole socket
-		//timeout past it. That slack is why the budget is counted in read timeouts rather than set
-		//as one: bounding the read itself would mean handing setSocketTimeout a shrinking value,
-		//and zero there means "wait forever", not "give up now".
-		private static DrainOutcome drain(InputStream in, ByteArrayOutputStream head, int limit,
-			long deadlineNanos) throws IOException {
-			byte[] chunk = new byte[8192];
-			long read = 0;
-			while (read <= limit) {
-				//subtraction, not comparison: it stays correct across a nanoTime wrap
-				if (System.nanoTime() - deadlineNanos >= 0) {
-					return DrainOutcome.OUT_OF_BUDGET;
-				}
-				int n = in.read(chunk, 0, (int) Math.min(chunk.length, limit + 1L - read));
-				if (n < 0) {
-					return DrainOutcome.COMPLETE;
-				}
-				head.write(chunk, 0, n);
-				read += n;
-			}
-			return DrainOutcome.OVER_LIMIT;
-		}
-
-		//an InterruptedIOException rather than a SocketTimeoutException: no socket timed out, the
-		//budget did, and bytesTransferred is the one field able to say how far the body got
-		private static InterruptedIOException outOfBudget(int received) {
-			InterruptedIOException failure = new InterruptedIOException(
-					"response body still arriving when the drain budget ran out"); //$NON-NLS-1$
-			failure.bytesTransferred = received;
-			return failure;
+			//the exact code, not a 2xx range: the sign-in page this class was written for arrives
+			//as 203, and every status but 200 is one TransportHttp throws on
+			response.setEntity(withMetadataOf(body, new DiscardedBody(body.getContentLength())));
+			//closing the response, never the body stream. HttpResponseProxy.close() reaches
+			//ConnectionHolder.close() -> releaseConnection(false) -> managedConn.close(). The body
+			//stream would instead reach ResponseEntityProxy.streamClosed, which closes the stream
+			//it wraps — and ContentLengthInputStream.close() reads the whole remainder to discard
+			//it, which is the wait this interceptor exists to avoid
+			closeQuietly(closeable);
+			exchange.bodyReleased(closeable);
 		}
 
 		//the replacement has to carry the original Content-Type and Content-Encoding, so that
-		//ResponseContentEncoding still decompresses and still strips those headers; dropping them
-		//would leave Content-Encoding in place and wake up the gzip path in TransportHttp
+		//ResponseContentEncoding still strips those headers; dropping them would leave
+		//Content-Encoding in place and wake up the gzip path in TransportHttp
 		private static <T extends AbstractHttpEntity> T withMetadataOf(HttpEntity original,
 				T replacement) {
 			replacement.setContentType(original.getContentType());
@@ -995,57 +851,21 @@ public class B3HttpClientConnection implements HttpConnection {
 	}
 
 	/**
-	 * A buffered response body that keeps reporting the length the wire framed it with rather than
-	 * the buffer's own size. ResponseContentEncoding skips a body whose entity reports zero, so a
-	 * chunked response that carried Content-Encoding and turned out to be empty would otherwise keep
-	 * that header and have TransportHttp gzip-wrap an empty stream. Reporting the framed length keeps
-	 * that decision identical to the one taken on the entity this replaces.
+	 * Stands in for a body closed unread, and says so to anyone who asks for it.
 	 * <p>
-	 * The two figures only ever differ for a chunked body, which frames no length at all: a declared
-	 * length that the body then falls short of never reaches here, because reading such a body to
-	 * its end raises ConnectionClosedException, which lands the exchange on {@link FailedBody}
-	 * instead. Nothing on this path closes a body early — the one close is of a body already read
-	 * whole — and nothing should start to: that close is what makes the release deterministic.
+	 * It reports the length the body was framed with rather than zero, so that
+	 * ResponseContentEncoding takes the decision it would have taken on the entity being replaced:
+	 * that class skips its work — leaving Content-Encoding in place — only for a length of exactly
+	 * 0, and TransportHttp would then gzip-wrap an empty stream.
+	 * <p>
+	 * {@code isStreaming()} is false, and load-bearing: RedirectExec calls
+	 * {@code EntityUtils.consume} on every hop it follows, and that reads the content only for a
+	 * streaming entity. Reporting true would send it reading a body whose socket is already gone.
 	 */
-	private static final class BufferedBody extends ByteArrayEntity {
+	private static final class DiscardedBody extends AbstractHttpEntity {
 		private final long framedLength;
 
-		BufferedBody(byte[] body, long framedLength) {
-			super(body);
-			this.framedLength = framedLength;
-		}
-
-		@Override
-		public long getContentLength() {
-			return framedLength;
-		}
-	}
-
-	/**
-	 * Hands on the bytes that did arrive, then the failure that stopped the rest.
-	 * <p>
-	 * Unlike {@link BufferedBody} this really does report a length it cannot deliver — the one the
-	 * response declared, against a prefix of the body. It has to: reporting the prefix's length
-	 * would put a zero in front of ResponseContentEncoding for a body that died before its first
-	 * byte, where the chunked entity being replaced reported -1, and the header-stripping would
-	 * differ from the unbroken case for no good reason.
-	 * <p>
-	 * What that costs is a size hint nobody should trust. {@code EntityUtils.toByteArray} allocates
-	 * {@code new ByteArrayBuffer((int) getContentLength())} up front, capped only at
-	 * {@code Integer.MAX_VALUE} with negatives falling back to a default — so calling it on this
-	 * entity would allocate whatever the response claimed, up to 2 GB, to hold a prefix. No caller
-	 * does today, and none should be added: read the stream instead.
-	 */
-	private static final class FailedBody extends AbstractHttpEntity {
-		private final byte[] head;
-
-		private final IOException failure;
-
-		private final long framedLength;
-
-		FailedBody(byte[] head, IOException failure, long framedLength) {
-			this.head = head;
-			this.failure = failure;
+		DiscardedBody(long framedLength) {
 			this.framedLength = framedLength;
 		}
 
@@ -1055,64 +875,28 @@ public class B3HttpClientConnection implements HttpConnection {
 		}
 
 		@Override
+		public boolean isStreaming() {
+			return false;
+		}
+
+		@Override
 		public long getContentLength() {
 			return framedLength;
 		}
 
 		@Override
-		public InputStream getContent() {
-			return new FailedBodyStream(head, failure);
+		public InputStream getContent() throws IOException {
+			throw discarded();
 		}
 
 		@Override
 		public void writeTo(OutputStream outStream) throws IOException {
-			outStream.write(head);
-			throw failure;
+			throw discarded();
 		}
 
-		@Override
-		public boolean isStreaming() {
-			return false;
-		}
-	}
-
-	private static final class FailedBodyStream extends InputStream {
-		private final byte[] head;
-
-		private final IOException failure;
-
-		private int next;
-
-		FailedBodyStream(byte[] head, IOException failure) {
-			this.head = head;
-			this.failure = failure;
-		}
-
-		@Override
-		public int read() throws IOException {
-			if (next < head.length) {
-				return head[next++] & 0xff;
-			}
-			throw failure;
-		}
-
-		@Override
-		public int read(byte[] b, int off, int len) throws IOException {
-			if (len == 0) {
-				return 0;
-			}
-			if (next >= head.length) {
-				throw failure;
-			}
-			int n = Math.min(len, head.length - next);
-			System.arraycopy(head, next, b, off, n);
-			next += n;
-			return n;
-		}
-
-		@Override
-		public int available() {
-			return head.length - next;
+		private static IOException discarded() {
+			return new IOException("the body of this response was closed unread: nothing reads " //$NON-NLS-1$
+					+ "the body of a response other than 200"); //$NON-NLS-1$
 		}
 	}
 
