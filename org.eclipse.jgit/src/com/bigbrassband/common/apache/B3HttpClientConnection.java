@@ -734,10 +734,11 @@ public class B3HttpClientConnection implements HttpConnection {
 		//the caller reached the end of a taken body or closed it, which ends the exchange for good:
 		//no further hop can follow, so the verdict need not wait for collection
 		void bodyFinished() {
-			//the stream underneath releases the connection on its own — except under
-			//decompression, where GZIPInputStream reports its own end after its trailer and only
-			//consults the stream below it while available() > 0, which on a socket it is not. So
-			//the end of a decompressed body would otherwise record a release nobody performed.
+			//closing the response here rather than leaving it to the stream: on the close path this
+			//is what releases the holder before super.close() reaches ContentLengthInputStream
+			//.close() and has it read the rest of the body to discard it. On the read-to-end path
+			//the stream underneath has normally released already — normally, because whether a
+			//decompressing stream drives the one below it to -1 is not visible to any test here.
 			closeQuietly(response);
 			state.set(State.RELEASED);
 			account();
