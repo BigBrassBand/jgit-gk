@@ -167,6 +167,7 @@ public class B3HttpClientConnection implements HttpConnection {
 
 	private final B3HttpClientConnectionFactory.HttpClientConnectionManagerFactory httpClientConnectionManagerFactory;
 	private final Exchange exchange = new Exchange();
+	private TrackedBodyStream takenBody;
 	//CloseableHttpClient rather than HttpClient because only its execute() returns a
 	//CloseableHttpResponse, and the response is what has to be closed. The client itself is
 	//never closed on purpose: the connection manager can come from an outside factory, and
@@ -242,9 +243,18 @@ public class B3HttpClientConnection implements HttpConnection {
 	 *         rides on and so goes unreported even though it did issue a request, and one whose
 	 *         request never came back with a response at all — connection refused, DNS or TLS
 	 *         failure, a timeout on the status line — which leaves the exchange where it
-	 *         started and reports nothing when collected. None of the four left a socket open, so
-	 *         the residual is not a leak; but the last of them grows with the failure rate, so
-	 *         against an unreachable host it is not small either.
+	 *         started and reports nothing when collected.
+	 *         <p>
+	 *         Three of those four left no socket open. The third did: without the interceptor
+	 *         nothing releases the connection and nothing counts it, so that residual is a leak
+	 *         this counter cannot see. The fourth grows with the failure rate, so against an
+	 *         unreachable host the residual is not small either.
+	 *         <p>
+	 *         This counter changed definition without changing name. It used to be incremented by
+	 *         a cleanup action registered unconditionally, so it tracked collected connections and
+	 *         all but repeated {@link #getInitCount()}; it now counts only exchanges that ended
+	 *         with a body still on the socket. A series spanning the change steps down for that
+	 *         reason and not for a change in leaking.
 	 */
 	public static long getAbandonedCount() {
 		return abandonedCount.getAndSet(0L);
@@ -377,7 +387,12 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * @param urlStr urlStr
 	 * @param connectTimeoutSeconds connectTimeoutSeconds
 	 * @param proxy proxy
-	 * @param cl cl
+	 * @param cl a client to use instead of the one this class builds. Unsupported for anything
+	 *            that cares about sockets: the bookkeeping rides on an interceptor registered while
+	 *            building the client, so a client supplied here carries none of it. Such an
+	 *            exchange releases no connection and reports nothing beyond its init, and its
+	 *            connection manager outlives this object — with a single-connection manager, the
+	 *            leased entry is never returned and the next lease blocks.
 	 * @param httpClientConnectionManagerFactory httpClientConnectionManagerFactory
 	 * @throws MalformedURLException MalformedURLException
 	 */
@@ -439,9 +454,10 @@ public class B3HttpClientConnection implements HttpConnection {
 			}
 			resp = getClient().execute(req,context);
 		} finally {
-			//a null resp is the only sign of a failed chain available here, and the exchange has to
-			//be told either way: a hop closed unread just before the throw would otherwise be left
-			//looking like a body still on the socket, i.e. reported as abandoned
+			//a null resp is the only sign of a failed chain available here. What exchangeFailed()
+			//saves is the opposite hop: one whose body is still on the socket when the chain threw,
+			//which the exec chain closes on its way out and which would otherwise be collected and
+			//reported as abandoned
 			if (resp == null) {
 				exchange.exchangeFailed();
 			} else {
@@ -523,6 +539,12 @@ public class B3HttpClientConnection implements HttpConnection {
 	@Override
 	public InputStream getInputStream() throws IOException {
 		try {
+			//the same instance on every later call: a second TrackedBodyStream would carry a second
+			//cleaner, and an untracked stream would let the first one's collection report an
+			//abandonment against an exchange that ended cleanly
+			if (takenBody != null) {
+				return takenBody;
+			}
 			if (exchange.isBodyOnSocket()) {
 				//JGit drops the connection as soon as it has the stream (TransportHttp does
 				//in.add(openInputStream(conn)); conn = null), so from here on the body's fate is
@@ -530,6 +552,7 @@ public class B3HttpClientConnection implements HttpConnection {
 				TrackedBodyStream body = new TrackedBodyStream(resp.getEntity().getContent(), exchange);
 				Exchange onCollection = this.exchange;
 				CLEANER.register(body, onCollection::bodyStreamGone);
+				takenBody = body;
 				//only once something is watching that stream: a taken body nobody can settle would
 				//leave the connection's cleaner deferring for good, socket included
 				exchange.bodyTaken();
@@ -790,11 +813,19 @@ public class B3HttpClientConnection implements HttpConnection {
 	/**
 	 * Closes the connection of any response other than 200, before the caller sees it.
 	 * <p>
-	 * Nothing reads such a body. jgit's {@code TransportHttp} throws on the status line — from
-	 * {@code openResponse} on every service call, and from each {@code case} of {@code connect}
-	 * that is not {@code HTTP_OK} — and builds its message out of the status line rather than the
-	 * body. So there is nothing here to preserve, and reading the body off the wire first would
-	 * only make the caller wait for bytes on their way to being discarded.
+	 * Nothing on the transport path reads such a body. jgit's {@code TransportHttp} throws on the
+	 * status line — from {@code openResponse} on every service call, and from each {@code case} of
+	 * {@code connect} that is not {@code HTTP_OK} — and builds its message out of the status line
+	 * rather than the body. So there is nothing there to preserve, and reading the body off the
+	 * wire first would only make the caller wait for bytes on their way to being discarded.
+	 * <p>
+	 * That rule is the transport's, not the whole fork's: {@code org.eclipse.jgit.lfs.SmudgeFilter}
+	 * accepts 203 alongside 200 and parses that body as JSON, and it takes its connection from the
+	 * same process-wide {@code HttpTransport} connection factory. Under this
+	 * interceptor such a response arrives discarded. The LFS module is out of scope deliberately
+	 * rather than by oversight: 203 is the status of the sign-in page this class exists to stop
+	 * leaking, so admitting it would give up the fix. Anything wiring this factory and LFS together
+	 * needs a different answer than this one.
 	 * <p>
 	 * A 200 is left alone entirely: that body is the one the caller asked for, and the caller's
 	 * own reading is what releases its socket.
@@ -838,6 +869,11 @@ public class B3HttpClientConnection implements HttpConnection {
 			//the exact code, not a 2xx range: the sign-in page this class was written for arrives
 			//as 203, and every status but 200 is one TransportHttp throws on
 			response.setEntity(withMetadataOf(body, new DiscardedBody(body.getContentLength())));
+			if (closeable == null) {
+				//no handle to close, so the exchange keeps saying the body is on the socket: the
+				//counters may not report a release nobody performed
+				return;
+			}
 			//closing the response, never the body stream. HttpResponseProxy.close() reaches
 			//ConnectionHolder.close() -> releaseConnection(false) -> managedConn.close(). The body
 			//stream would instead reach ResponseEntityProxy.streamClosed, which closes the stream
@@ -921,8 +957,8 @@ public class B3HttpClientConnection implements HttpConnection {
 			this.exchange = exchange;
 		}
 
-		//the fence in all three: this stream's cleanup action is registered on the exchange, not on
-		//the stream, so the stream may be collected while one of its own methods is still running
+		//the fence in every method below: this stream's cleanup action is registered on the
+		//exchange, not on the stream, so it may be collected while one of its own methods is running
 		//— the only touch of this after the delegated call is a final field, which may be hoisted
 		//above it. A cleaner running in that window would close the socket under an active read
 		//and record the orderly close as an abandonment. Same hazard getInputStream() fences.
@@ -952,16 +988,39 @@ public class B3HttpClientConnection implements HttpConnection {
 			}
 		}
 
+		//bodyFinished() before super.close(), not after: super.close() reaches
+		//ResponseEntityProxy.streamClosed, which closes the stream it wraps, and
+		//ContentLengthInputStream.close() reads the whole remainder off the wire to discard it.
+		//Closing the response first marks the holder released, so that read fails at once and the
+		//SocketException it raises is swallowed there rather than surfacing here
 		@Override
 		public void close() throws IOException {
 			try {
-				super.close();
+				exchange.bodyFinished();
 			} finally {
 				try {
-					exchange.bodyFinished();
+					super.close();
 				} finally {
 					Reference.reachabilityFence(this);
 				}
+			}
+		}
+
+		@Override
+		public long skip(long n) throws IOException {
+			try {
+				return super.skip(n);
+			} finally {
+				Reference.reachabilityFence(this);
+			}
+		}
+
+		@Override
+		public int available() throws IOException {
+			try {
+				return super.available();
+			} finally {
+				Reference.reachabilityFence(this);
 			}
 		}
 	}
