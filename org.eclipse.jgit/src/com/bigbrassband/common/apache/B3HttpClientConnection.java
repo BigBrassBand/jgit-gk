@@ -144,8 +144,10 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_PUT;
  * settled by whichever comes first: the exec chain returning, for a response already closed
  * unread; the body stream reaching its end or being closed; or collection — of the connection,
  * or of the stream, two cleaners with the connection's deferring to the stream's while a body is
- * out. A compare-and-set inside {@code Exchange} keeps that to one verdict per connection, so a
- * redirect chain that released four sockets still reports once.
+ * out. The connection also holds the stream it handed out, so the stream's collection cannot
+ * precede the connection's — it coincides with it or follows it. A compare-and-set inside
+ * {@code Exchange} keeps all of this to one verdict per connection, so a redirect chain that
+ * released four sockets still reports once.
  * <p>
  * <b>No cleanup action may reach what it watches.</b> An action able to reach this connection
  * would keep it alive for good, turning the socket leak into a memory leak, so every registered
@@ -245,9 +247,9 @@ public class B3HttpClientConnection implements HttpConnection {
 	 *         failure, a timeout on the status line — which leaves the exchange where it
 	 *         started and reports nothing when collected.
 	 *         <p>
-	 *         Three of those four left no socket open. The third did: without the interceptor
-	 *         nothing releases the connection and nothing counts it, so that residual is a leak
-	 *         this counter cannot see. The fourth grows with the failure rate, so against an
+	 *         Three of those four left no socket open. The third can: a body read to its end
+	 *         releases through httpclient's own stream, but one left unread releases nothing and
+	 *         counts nothing, so that residual is a leak this counter cannot see. The fourth grows with the failure rate, so against an
 	 *         unreachable host the residual is not small either.
 	 *         <p>
 	 *         This counter changed definition without changing name. It used to be incremented by
@@ -390,9 +392,10 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * @param cl a client to use instead of the one this class builds. Unsupported for anything
 	 *            that cares about sockets: the bookkeeping rides on an interceptor registered while
 	 *            building the client, so a client supplied here carries none of it. Such an
-	 *            exchange releases no connection and reports nothing beyond its init, and its
-	 *            connection manager outlives this object — with a single-connection manager, the
-	 *            leased entry is never returned and the next lease blocks.
+	 *            body read to its end still releases, because httpclient's own stream does that
+	 *            without help; one left unread or dropped releases nothing and reaches no counter.
+	 *            The connection manager also outlives this object, so with a single-connection
+	 *            manager such a body never returns the leased entry and the next lease blocks.
 	 * @param httpClientConnectionManagerFactory httpClientConnectionManagerFactory
 	 * @throws MalformedURLException MalformedURLException
 	 */
@@ -737,8 +740,8 @@ public class B3HttpClientConnection implements HttpConnection {
 			//closing the response here rather than leaving it to the stream: on the close path this
 			//is what releases the holder before super.close() reaches ContentLengthInputStream
 			//.close() and has it read the rest of the body to discard it. On the read-to-end path
-			//the stream underneath has normally released already — normally, because whether a
-			//decompressing stream drives the one below it to -1 is not visible to any test here.
+			//it is a no-op: a decompressing stream does drive the one below it to -1 after its
+			//trailer — measured on 17 at four body sizes — so the holder is released before this.
 			closeQuietly(response);
 			state.set(State.RELEASED);
 			account();
@@ -757,7 +760,14 @@ public class B3HttpClientConnection implements HttpConnection {
 		//can say released rather than let a cleaner report a leak that did not happen. Every other
 		//state already tells the truth and is left to be counted at collection.
 		void exchangeFailed() {
-			if (state.get() != State.BODY_ON_SOCKET) {
+			State current = state.get();
+			if (current == State.RELEASED) {
+				//the same immediate verdict exchangeSettled() gives: both are called from the
+				//finally of execute(), so a hop that already released has nothing left to wait for
+				account();
+				return;
+			}
+			if (current != State.BODY_ON_SOCKET) {
 				return;
 			}
 			closeQuietly(response);
@@ -780,10 +790,8 @@ public class B3HttpClientConnection implements HttpConnection {
 		//one verdict per connection, so that init roughly equals close + abandoned for a metrics
 		//reader; a redirect chain releases several sockets under one connection and must not report
 		//a release for each.
-		//Guarding the closing with that same compare-and-set would mean that after the first
-		//verdict no socket could ever be closed again — and a second exchange on this
-		//connection still has one to give back. Closing an already-released holder is a
-		//no-op, so doing it every time costs nothing.
+		//The closing sits outside that compare-and-set because closing an already-released
+		//holder is a no-op — there is nothing for a guard to save.
 		private void account() {
 			State current = state.get();
 			if (current == State.BODY_ON_SOCKET || current == State.BODY_TAKEN) {
@@ -828,6 +836,10 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * leaking, so admitting it would give up the fix. Anything wiring this factory and LFS together
 	 * needs a different answer than this one.
 	 * <p>
+	 * The fork's other consumer is untouched by that: GIJ Data Center installs a same-named factory
+	 * from {@code org.eclipse.jgit.transport.http.apache}, not this package, pins the {@code -r-gk}
+	 * line where this package does not exist, and uses no LFS on any of its active branches.
+	 * <p>
 	 * A 200 is left alone entirely: that body is the one the caller asked for, and the caller's
 	 * own reading is what releases its socket.
 	 * <p>
@@ -869,12 +881,13 @@ public class B3HttpClientConnection implements HttpConnection {
 			}
 			//the exact code, not a 2xx range: the sign-in page this class was written for arrives
 			//as 203, and every status but 200 is one TransportHttp throws on
-			response.setEntity(withMetadataOf(body, new DiscardedBody(body.getContentLength())));
 			if (closeable == null) {
-				//no handle to close, so the exchange keeps saying the body is on the socket: the
-				//counters may not report a release nobody performed
+				//nothing to close, so nothing changes here: leaving the real body in place keeps
+				//the caller's own reading able to release the socket, which a replacement that
+				//throws would take away
 				return;
 			}
+			response.setEntity(withMetadataOf(body, new DiscardedBody(body.getContentLength())));
 			//closing the response, never the body stream. HttpResponseProxy.close() reaches
 			//ConnectionHolder.close() -> releaseConnection(false) -> managedConn.close(). The body
 			//stream would instead reach ResponseEntityProxy.streamClosed, which closes the stream
