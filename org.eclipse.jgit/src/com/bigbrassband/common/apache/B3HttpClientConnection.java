@@ -876,7 +876,8 @@ public class B3HttpClientConnection implements HttpConnection {
 				exchange.bodyReleased(closeable);
 				return;
 			}
-			if (response.getStatusLine().getStatusCode() == HttpStatus.SC_OK) {
+			int status = response.getStatusLine().getStatusCode();
+			if (status == HttpStatus.SC_OK) {
 				return;
 			}
 			//the exact code, not a 2xx range: the sign-in page this class was written for arrives
@@ -887,7 +888,7 @@ public class B3HttpClientConnection implements HttpConnection {
 				//throws would take away
 				return;
 			}
-			response.setEntity(withMetadataOf(body, new DiscardedBody(body.getContentLength())));
+			response.setEntity(withMetadataOf(body, new DiscardedBody(body.getContentLength(), status)));
 			//closing the response, never the body stream. HttpResponseProxy.close() reaches
 			//ConnectionHolder.close() -> releaseConnection(false) -> managedConn.close(). The body
 			//stream would instead reach ResponseEntityProxy.streamClosed, which closes the stream
@@ -923,8 +924,11 @@ public class B3HttpClientConnection implements HttpConnection {
 	private static final class DiscardedBody extends AbstractHttpEntity {
 		private final long framedLength;
 
-		DiscardedBody(long framedLength) {
+		private final int status;
+
+		DiscardedBody(long framedLength, int status) {
 			this.framedLength = framedLength;
+			this.status = status;
 		}
 
 		@Override
@@ -952,9 +956,11 @@ public class B3HttpClientConnection implements HttpConnection {
 			throw discarded();
 		}
 
-		private static IOException discarded() {
-			return new IOException("the body of this response was closed unread: nothing reads " //$NON-NLS-1$
-					+ "the body of a response other than 200"); //$NON-NLS-1$
+		//the status is the whole diagnostic value here: this exception is all a caller gets, and
+		//without it a 203 sign-in page and a 500 read identically in a support log
+		private IOException discarded() {
+			return new IOException("the body of this " + status //$NON-NLS-1$
+					+ " response was closed unread: nothing reads the body of a response other than 200"); //$NON-NLS-1$
 		}
 	}
 
