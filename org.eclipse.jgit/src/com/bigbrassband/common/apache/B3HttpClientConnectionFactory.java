@@ -67,8 +67,7 @@ public class B3HttpClientConnectionFactory implements HttpConnectionFactory {
 	 * B3HttpClientConnectionFactory
 	 */
 	public B3HttpClientConnectionFactory() {
-		this.httpClientConnectionManagerFactory=null;
-		this.connectTimeoutSeconds=0;
+		this(null, 0);
 	}
 
 	/**
@@ -77,8 +76,7 @@ public class B3HttpClientConnectionFactory implements HttpConnectionFactory {
 	 * @param httpClientConnectionManagerFactory HttpClientConnectionManagerFactory
 	 */
 	public B3HttpClientConnectionFactory(HttpClientConnectionManagerFactory httpClientConnectionManagerFactory) {
-		this.httpClientConnectionManagerFactory=httpClientConnectionManagerFactory;
-		this.connectTimeoutSeconds=0;
+		this(httpClientConnectionManagerFactory, 0);
 	}
 
 	/**
@@ -117,7 +115,8 @@ public class B3HttpClientConnectionFactory implements HttpConnectionFactory {
 	@Override
 	public HttpConnection create(URL url, Proxy proxy)
 			throws IOException {
-		return new B3HttpClientConnection(url.toString(), connectTimeoutSeconds, proxy, httpClientConnectionManagerFactory);
+		return new B3HttpClientConnection(url.toString(), connectTimeoutSeconds, proxy,
+				httpClientConnectionManagerFactory);
 	}
 
 	/**
