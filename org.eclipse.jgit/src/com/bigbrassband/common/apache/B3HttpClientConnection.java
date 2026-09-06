@@ -223,9 +223,11 @@ public class B3HttpClientConnection implements HttpConnection {
 	}
 
 	/**
-	 * @return number of exchanges that released their connection since last call (resets counter).
-	 *         Both ways of releasing land here and are not told apart: a body the caller read to
-	 *         its end, and a response other than 200 whose connection was closed unread.
+	 * @return number of exchanges whose connection came back, since last call (resets counter).
+	 *         Every way of getting there lands here and none is told apart — a body read to its
+	 *         end, a body closed before it, a response other than 200 closed unread, a response
+	 *         with no streaming body to begin with, and a chain that threw over a body still on
+	 *         the socket.
 	 */
 	public static long getCloseCount() {
 		return closeCount.getAndSet(0L);
@@ -247,10 +249,13 @@ public class B3HttpClientConnection implements HttpConnection {
 	 *         failure, a timeout on the status line — which leaves the exchange where it
 	 *         started and reports nothing when collected.
 	 *         <p>
-	 *         Three of those four left no socket open. The third can: a body read to its end
-	 *         releases through httpclient's own stream, but one left unread releases nothing and
-	 *         counts nothing, so that residual is a leak this counter cannot see. The fourth grows with the failure rate, so against an
-	 *         unreachable host the residual is not small either.
+	 *         Only the third can leave a socket open: a body read to its end releases through
+	 *         httpclient's own stream, but one left unread releases nothing and counts nothing, so
+	 *         those are leaks this counter cannot see.
+	 *         <p>
+	 *         The fourth leaves no socket open and still widens the gap between init and close,
+	 *         because it reports neither. Against an unreachable host it grows with the failure
+	 *         rate, so a gap that is normally small need not stay small.
 	 *         <p>
 	 *         This counter changed definition without changing name. It used to be incremented by
 	 *         a cleanup action registered unconditionally, so it tracked collected connections and
@@ -266,11 +271,16 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * @return number of responses whose body was left on the socket and was then never read at
 	 *         all, since last call (resets counter).
 	 *         <p>
-	 *         Only a 200 can land here: every other status has its connection closed before the
-	 *         caller sees the response. So a body counted here is one the caller asked for and
-	 *         walked away from without reading — which no setting answers, and which nothing in
-	 *         jgit's {@code TransportHttp} does today. A non-zero count names a caller to look at,
-	 *         not a number to change.
+	 *         On the httpclient this builds against, only a 200 reaches here: every other status
+	 *         has its connection closed before the caller sees the response, because {@code
+	 *         ProtocolExec} always hands the interceptor an {@code HttpResponseProxy} and that is
+	 *         {@link Closeable}. A response that is not would take the one branch that closes
+	 *         nothing, and could be counted here whatever its status.
+	 *         <p>
+	 *         So a body counted here is one the caller asked for and walked away from without
+	 *         reading — which no setting answers, and which nothing in jgit's
+	 *         {@code TransportHttp} does today. A non-zero count names a caller to look at, not a
+	 *         number to change.
 	 */
 	public static long getStreamedUnreadCount() {
 		return streamedUnreadCount.getAndSet(0L);
@@ -391,11 +401,12 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * @param proxy proxy
 	 * @param cl a client to use instead of the one this class builds. Unsupported for anything
 	 *            that cares about sockets: the bookkeeping rides on an interceptor registered while
-	 *            building the client, so a client supplied here carries none of it. Such an
-	 *            body read to its end still releases, because httpclient's own stream does that
-	 *            without help; one left unread or dropped releases nothing and reaches no counter.
-	 *            The connection manager also outlives this object, so with a single-connection
-	 *            manager such a body never returns the leased entry and the next lease blocks.
+	 *            building the client, so a client supplied here carries none of it. A body read to
+	 *            its end on such an exchange still releases, because httpclient's own stream does
+	 *            that without help; a body left unread or dropped releases nothing and reaches no
+	 *            counter. The connection manager also outlives this object, so with a
+	 *            single-connection manager that unread body never returns the leased entry and the
+	 *            next lease blocks.
 	 * @param httpClientConnectionManagerFactory httpClientConnectionManagerFactory
 	 * @throws MalformedURLException MalformedURLException
 	 */
@@ -836,9 +847,10 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * leaking, so admitting it would give up the fix. Anything wiring this factory and LFS together
 	 * needs a different answer than this one.
 	 * <p>
-	 * The fork's other consumer is untouched by that: GIJ Data Center installs a same-named factory
-	 * from {@code org.eclipse.jgit.transport.http.apache}, not this package, pins the {@code -r-gk}
-	 * line where this package does not exist, and uses no LFS on any of its active branches.
+	 * The fork's other consumer cannot reach this code at all: GIJ Data Center installs a
+	 * same-named factory from {@code org.eclipse.jgit.transport.http.apache}, not this package, and
+	 * pins the {@code -r-gk} line, where this package does not exist. Both are checkable from this
+	 * repository; whether DC also uses LFS is not, and does not matter while that holds.
 	 * <p>
 	 * A 200 is left alone entirely: that body is the one the caller asked for, and the caller's
 	 * own reading is what releases its socket.
@@ -876,12 +888,12 @@ public class B3HttpClientConnection implements HttpConnection {
 				exchange.bodyReleased(closeable);
 				return;
 			}
+			//the exact code, not a 2xx range: the sign-in page this class was written for arrives
+			//as 203, and every status but 200 is one TransportHttp throws on
 			int status = response.getStatusLine().getStatusCode();
 			if (status == HttpStatus.SC_OK) {
 				return;
 			}
-			//the exact code, not a 2xx range: the sign-in page this class was written for arrives
-			//as 203, and every status but 200 is one TransportHttp throws on
 			if (closeable == null) {
 				//nothing to close, so nothing changes here: leaving the real body in place keeps
 				//the caller's own reading able to release the socket, which a replacement that
