@@ -663,29 +663,7 @@ public class B3HttpClientConnection implements HttpConnection {
 
 	@Override
 	public void setHostnameVerifier(final HostnameVerifier hostnameverifier) {
-		this.hostnameverifier = new X509HostnameVerifier() {
-			@Override
-			public boolean verify(String hostname, SSLSession session) {
-				return hostnameverifier.verify(hostname, session);
-			}
-
-			@Override
-			public void verify(String host, String[] cns, String[] subjectAlts)
-					throws SSLException {
-				throw new UnsupportedOperationException(); // TODO message
-			}
-
-			@Override
-			public void verify(String host, X509Certificate cert)
-					throws SSLException {
-				throw new UnsupportedOperationException(); // TODO message
-			}
-
-			@Override
-			public void verify(String host, SSLSocket ssl) throws IOException {
-				hostnameverifier.verify(host, ssl.getSession());
-			}
-		};
+		this.hostnameverifier = new CallerHostnameVerifier(hostnameverifier);
 	}
 
 	@Override
@@ -701,6 +679,43 @@ public class B3HttpClientConnection implements HttpConnection {
 			} catch (IOException e) {
 				//the exchange is over either way, and there is no caller left to report to
 			}
+		}
+	}
+
+	/**
+	 * javac gives an anonymous class a reference to its enclosing instance whether or not the body uses
+	 * one, and {@link #getClient()} puts this verifier inside the connection manager — from where a
+	 * response reaches back through its {@code ConnectionHolder}, the manager and the socket factory
+	 * registry. An anonymous verifier would close that circle onto the connection whose collection
+	 * {@link Exchange}'s cleanup actions wait for, and no cleaner would ever run.
+	 */
+	private static final class CallerHostnameVerifier implements X509HostnameVerifier {
+		private final HostnameVerifier delegate;
+
+		CallerHostnameVerifier(HostnameVerifier delegate) {
+			this.delegate = delegate;
+		}
+
+		@Override
+		public boolean verify(String hostname, SSLSession session) {
+			return delegate.verify(hostname, session);
+		}
+
+		@Override
+		public void verify(String host, String[] cns, String[] subjectAlts)
+				throws SSLException {
+			throw new UnsupportedOperationException(); // TODO message
+		}
+
+		@Override
+		public void verify(String host, X509Certificate cert)
+				throws SSLException {
+			throw new UnsupportedOperationException(); // TODO message
+		}
+
+		@Override
+		public void verify(String host, SSLSocket ssl) throws IOException {
+			delegate.verify(host, ssl.getSession());
 		}
 	}
 
@@ -827,6 +842,10 @@ public class B3HttpClientConnection implements HttpConnection {
 				//NOT_STARTED: no request was ever issued, so there is nothing to report
 				break;
 			}
+			//frees the holder, the manager and the socket factory registry now rather than when the last
+			//of the two cleanup actions runs — until then the cleaner's own list holds this exchange.
+			//A close racing this one finds null and skips a close that already happened.
+			response = null;
 		}
 	}
 
