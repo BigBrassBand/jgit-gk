@@ -946,7 +946,9 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * It reports the length the body was framed with rather than zero, so that
 	 * ResponseContentEncoding takes the decision it would have taken on the entity being replaced:
 	 * that class skips its work — leaving Content-Encoding in place — only for a length of exactly
-	 * 0, and TransportHttp would then gzip-wrap an empty stream.
+	 * 0, and the caller would then hold a response whose Content-Encoding describes nothing. It
+	 * stops there: TransportHttp.openInputStream calls getInputStream() before it tests
+	 * isGzipContent, so on a discarded body it throws below and never reaches the gzip wrap.
 	 * <p>
 	 * {@code isStreaming()} is false, and load-bearing: RedirectExec calls
 	 * {@code EntityUtils.consume} on every hop it follows, and that reads the content only for a
@@ -1008,11 +1010,11 @@ public class B3HttpClientConnection implements HttpConnection {
 			this.exchange = exchange;
 		}
 
-		//the fence in every method below: this stream's cleanup action is registered on the
-		//exchange, not on the stream, so it may be collected while one of its own methods is running
-		//— the only touch of this after the delegated call is a final field, which may be hoisted
-		//above it. A cleaner running in that window would close the socket under an active read
-		//and record the orderly close as an abandonment. Same hazard getInputStream() fences.
+		//the fence in every method below: this stream's cleanup action watches the stream but refers to
+		//nothing in it — the receiver is the Exchange — so the stream may be collected while one of its
+		//own methods is still running. The only touch of this after the delegated call is a final field,
+		//which may be hoisted above it. A cleaner running in that window would close the socket under an
+		//active read and record the orderly close as an abandonment. Same hazard getInputStream() fences.
 		@Override
 		public int read() throws IOException {
 			try {
