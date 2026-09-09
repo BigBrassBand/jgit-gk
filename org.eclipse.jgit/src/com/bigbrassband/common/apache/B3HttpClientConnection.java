@@ -1043,12 +1043,12 @@ public class B3HttpClientConnection implements HttpConnection {
 		//ResponseEntityProxy.streamClosed, which drains whatever the caller left of the body so the
 		//socket could be reused, and releases the connection in its own finally either way. Releasing
 		//it first instead — to make that drain fail fast rather than read the remainder — leaves the
-		//drain reading a socket we closed, and what it reads back is a property of the transport: a
-		//plain socket raises SocketException, which streamClosed swallows once the holder is released,
-		//while an SSLSocket returns -1 and both body framings report that as a body that ended wrong —
-		//MalformedChunkCodingException, ConnectionClosedException — neither of which is swallowed, and
-		//jgit surfaces it as a failed ls-remote. So the drain runs on a live connection, as it did
-		//before this class took the exchange over.
+		//drain reading a socket we closed, and what that read returns is a property of the transport.
+		//A plain socket raises SocketException, which streamClosed swallows once the holder is released;
+		//an SSLSocket returns -1 — neither is specified, both measured on 17 — and both body framings
+		//report that -1 as a body that ended wrong —
+		//MalformedChunkCodingException, ConnectionClosedException — neither of which is swallowed, so
+		//jgit surfaces it as a failed ls-remote.
 		//The cost is paid by a caller that walks away from a 200 mid-body: closing it now waits out the
 		//server's delivery of the remainder. TransportHttp.openResponse is the live case — it takes a
 		//200, finds a content type it did not ask for, and closes the stream. A non-200 pays nothing:
