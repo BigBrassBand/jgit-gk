@@ -763,11 +763,11 @@ public class B3HttpClientConnection implements HttpConnection {
 		//the caller reached the end of a taken body or closed it, which ends the exchange for good:
 		//no further hop can follow, so the verdict need not wait for collection
 		void bodyFinished() {
-			//closing the response here rather than leaving it to the stream: on the close path this
-			//is what releases the holder before super.close() reaches ContentLengthInputStream
-			//.close() and has it read the rest of the body to discard it. On the read-to-end path
-			//it is a no-op: a decompressing stream does drive the one below it to -1 after its
-			//trailer — measured on 17 at four body sizes — so the holder is released before this.
+			//a no-op on both paths that reach here, and kept for the one that might not: the stream
+			//underneath releases the holder itself, on EOF through eofDetected and on close through
+			//streamClosed, and closing an already-released holder does nothing. What this cannot be is
+			//the release itself — a caller left holding a body whose socket we closed reads a failure
+			//off it, see TrackedBodyStream.close()
 			closeQuietly(response);
 			state.set(State.RELEASED);
 			account();
@@ -1039,18 +1039,27 @@ public class B3HttpClientConnection implements HttpConnection {
 			}
 		}
 
-		//bodyFinished() before super.close(), not after: super.close() reaches
-		//ResponseEntityProxy.streamClosed, which closes the stream it wraps, and
-		//ContentLengthInputStream.close() reads the whole remainder off the wire to discard it.
-		//Closing the response first marks the holder released, so that read fails at once and the
-		//SocketException it raises is swallowed there rather than surfacing here
+		//super.close() before bodyFinished(), not after. super.close() reaches
+		//ResponseEntityProxy.streamClosed, which drains whatever the caller left of the body so the
+		//socket could be reused, and releases the connection in its own finally either way. Releasing
+		//it first instead — to make that drain fail fast rather than read the remainder — leaves the
+		//drain reading a socket we closed, and what it reads back is a property of the transport: a
+		//plain socket raises SocketException, which streamClosed swallows once the holder is released,
+		//while an SSLSocket returns -1 and both body framings report that as a body that ended wrong —
+		//MalformedChunkCodingException, ConnectionClosedException — neither of which is swallowed, and
+		//jgit surfaces it as a failed ls-remote. So the drain runs on a live connection, as it did
+		//before this class took the exchange over.
+		//The cost is paid by a caller that walks away from a 200 mid-body: closing it now waits out the
+		//server's delivery of the remainder. TransportHttp.openResponse is the live case — it takes a
+		//200, finds a content type it did not ask for, and closes the stream. A non-200 pays nothing:
+		//the interceptor swaps its body for DiscardedBody and never hands the caller a stream
 		@Override
 		public void close() throws IOException {
 			try {
-				exchange.bodyFinished();
+				super.close();
 			} finally {
 				try {
-					super.close();
+					exchange.bodyFinished();
 				} finally {
 					Reference.reachabilityFence(this);
 				}
