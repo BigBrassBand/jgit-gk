@@ -1584,8 +1584,21 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 				// Must be protocol V2
 				LongPollService service = new LongPollService(SVC_UPLOAD_PACK,
 						getProtocolVersion());
-				init(service.getInputStream(), service.getOutputStream());
-				lsRefs(refSpecs, additionalPatterns);
+				// BBB customization begin
+				// lsRefs stops at the flush packet and never reads the body to
+				// its end, so the response keeps its connection, and doFetch
+				// replaces this stream without closing it. Silent as in
+				// doFetch: the refs are already read when it closes.
+				try (InputStream svcIn = new SilentInputStream(
+						service.getInputStream())) {
+					init(svcIn, service.getOutputStream());
+					lsRefs(refSpecs, additionalPatterns);
+				} catch (TransportException e) {
+					throw e;
+				} catch (IOException e) {
+					throw new TransportException(e.getMessage(), e);
+				}
+				// BBB customization end
 			}
 		}
 
