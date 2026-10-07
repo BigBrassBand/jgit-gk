@@ -44,6 +44,7 @@ package com.bigbrassband.common.apache;
 
 import com.bigbrassband.common.apache.internal.HttpApacheText;
 import org.apache.http.Header;
+import org.apache.http.HttpClientConnection;
 import org.apache.http.HttpEntity;
 import org.apache.http.HttpEntityEnclosingRequest;
 import org.apache.http.HttpHeaders;
@@ -65,12 +66,14 @@ import org.apache.http.client.methods.HttpUriRequest;
 import org.apache.http.client.protocol.HttpClientContext;
 import org.apache.http.config.Registry;
 import org.apache.http.config.RegistryBuilder;
+import org.apache.http.conn.ConnectionRequest;
+import org.apache.http.conn.HttpClientConnectionManager;
+import org.apache.http.conn.routing.HttpRoute;
 import org.apache.http.conn.socket.ConnectionSocketFactory;
 import org.apache.http.conn.socket.PlainConnectionSocketFactory;
 import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
 import org.apache.http.conn.ssl.X509HostnameVerifier;
 import org.apache.http.entity.AbstractHttpEntity;
-import org.apache.http.impl.NoConnectionReuseStrategy;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.impl.client.HttpClients;
@@ -95,6 +98,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.ref.Cleaner;
 import java.lang.ref.Reference;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -135,6 +139,8 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_PUT;
  * ask for one of those bodies is told it is gone rather than handed an empty one.
  * <li>{@code TrackedBodyStream} wraps a body handed to the caller and tells the exchange when
  * that body reaches its end or is closed.
+ * <li>{@code ClosingConnectionManager} wraps the connection manager and closes every connection
+ * handed back to it, so no socket outlives the exchange it served in any manager.
  * </ul>
  * <p>
  * <b>Three places can render the verdict, and one would not do.</b> {@code TransportHttp} drops
@@ -175,8 +181,8 @@ public class B3HttpClientConnection implements HttpConnection {
 	//never closed on purpose: the connection manager can come from an outside factory, and
 	//HttpClientBuilder adds that manager's shutdown to the client's own closeable resources
 	//unless it is marked shared — so closing the client here would stop a manager that other
-	//connections are still using. Nothing leaks by leaving it open: NoConnectionReuseStrategy
-	//means no socket is ever parked in the manager to begin with.
+	//connections are still using. Nothing leaks by leaving it open: ClosingConnectionManager
+	//closes every connection as it is released, so no socket is ever parked in the manager.
 	private CloseableHttpClient client;
 
 	private URL url;
@@ -305,12 +311,12 @@ public class B3HttpClientConnection implements HttpConnection {
 	private CloseableHttpClient getClient() {
 		if (client == null) {
 			HttpClientBuilder clientBuilder = HttpClients.custom();
-			clientBuilder.setConnectionReuseStrategy(NoConnectionReuseStrategy.INSTANCE);
 			//first, so the entity it replaces is the one that came off the wire rather than the
 			//decompressing wrapper ResponseContentEncoding puts around it
 			clientBuilder.addInterceptorFirst(new NonOkBodyCloser(exchange));
+			HttpClientConnectionManager connectionManager = null;
 			if(httpClientConnectionManagerFactory!=null)
-				clientBuilder.setConnectionManager(httpClientConnectionManagerFactory.getConnectionManager());
+				connectionManager = httpClientConnectionManagerFactory.getConnectionManager();
 			RequestConfig.Builder configBuilder = RequestConfig.custom();
 			if (proxy != null && !Proxy.NO_PROXY.equals(proxy)) {
 				isUsingProxy = true;
@@ -337,9 +343,14 @@ public class B3HttpClientConnection implements HttpConnection {
 						.register("https", sslConnectionFactory)
 						.register("http", PlainConnectionSocketFactory.getSocketFactory())
 						.build();
-				clientBuilder.setConnectionManager(
-						new BasicHttpClientConnectionManager(registry));
+				connectionManager = new BasicHttpClientConnectionManager(registry);
 			}
+			if (connectionManager == null) {
+				//the socket factories the builder's own default would have, without its pool: a manager
+				//the builder makes is one this class could not wrap
+				connectionManager = new BasicHttpClientConnectionManager();
+			}
+			clientBuilder.setConnectionManager(new ClosingConnectionManager(connectionManager));
 			configBuilder.setCookieSpec(CookieSpecs.STANDARD);
 			clientBuilder.setDefaultRequestConfig(configBuilder.build());
 
@@ -720,6 +731,78 @@ public class B3HttpClientConnection implements HttpConnection {
 	}
 
 	/**
+	 * Closes every connection handed back to the manager it wraps, so that whatever the reuse
+	 * strategy decided, no socket of this class stays in a manager after release.
+	 * <p>
+	 * The strategy is httpclient's default because NTLM needs a socket kept alive: httpclient
+	 * answers the challenge itself inside one {@code execute()}, and the server accepts the answer
+	 * only on the socket that carried the challenge. Between those legs the connection stays leased;
+	 * it reaches {@code releaseConnection} only once the exchange is over, which is where this
+	 * closes it. The price of keeping it is that such a challenge body is read to its end before
+	 * the next leg rather than dropped.
+	 * <p>
+	 * Closing on release rather than closing idle connections once {@code execute()} returns covers
+	 * a body the caller finishes later, and leaves alone the idle connections of other users of a
+	 * shared manager. Static for the reason {@code CallerHostnameVerifier} gives: a response reaches
+	 * this through its {@code ConnectionHolder}.
+	 */
+	private static final class ClosingConnectionManager implements HttpClientConnectionManager {
+		private final HttpClientConnectionManager delegate;
+
+		ClosingConnectionManager(HttpClientConnectionManager delegate) {
+			this.delegate = delegate;
+		}
+
+		@Override
+		public ConnectionRequest requestConnection(HttpRoute route, Object state) {
+			return delegate.requestConnection(route, state);
+		}
+
+		@Override
+		public void releaseConnection(HttpClientConnection conn, Object newState,
+				long validDuration, TimeUnit timeUnit) {
+			try {
+				closeQuietly(conn);
+			} finally {
+				delegate.releaseConnection(conn, newState, validDuration, timeUnit);
+			}
+		}
+
+		@Override
+		public void connect(HttpClientConnection conn, HttpRoute route, int connectTimeout,
+				HttpContext context) throws IOException {
+			delegate.connect(conn, route, connectTimeout, context);
+		}
+
+		@Override
+		public void upgrade(HttpClientConnection conn, HttpRoute route, HttpContext context)
+				throws IOException {
+			delegate.upgrade(conn, route, context);
+		}
+
+		@Override
+		public void routeComplete(HttpClientConnection conn, HttpRoute route, HttpContext context)
+				throws IOException {
+			delegate.routeComplete(conn, route, context);
+		}
+
+		@Override
+		public void closeIdleConnections(long idletime, TimeUnit timeUnit) {
+			delegate.closeIdleConnections(idletime, timeUnit);
+		}
+
+		@Override
+		public void closeExpiredConnections() {
+			delegate.closeExpiredConnections();
+		}
+
+		@Override
+		public void shutdown() {
+			delegate.shutdown();
+		}
+	}
+
+	/**
 	 * State of one HTTP exchange, shared between the connection and a body stream that outlives it.
 	 * <p>
 	 * Reachable from neither: a cleanup action that could reach the object it watches would keep that
@@ -885,7 +968,7 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * Runs once per hop, so a redirect chain resolved inside httpclient reaches it for every
 	 * response in the chain: the 3xx hops are closed here, the final 200 is not. That is the same
 	 * socket-per-hop count as without this interceptor, since httpclient leases again for each hop
-	 * and NoConnectionReuseStrategy closes every socket regardless.
+	 * and ClosingConnectionManager closes every socket as it is released.
 	 */
 	private static final class NonOkBodyCloser implements HttpResponseInterceptor {
 		private final Exchange exchange;
