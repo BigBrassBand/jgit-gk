@@ -185,4 +185,34 @@ public interface FetchConnection extends Connection {
 	 *         order to safely permit garbage collection.
 	 */
 	Collection<PackLock> getPackLocks();
+
+	// BBB customization begin
+	/**
+	 * Whether the remote advertised a capability for fetching.
+	 * <p>
+	 * Answers from the advertisement already read when the connection was
+	 * opened; nothing is sent to the remote. For
+	 * {@link GitProtocolConstants#OPTION_FILTER} the answer matches the check
+	 * {@link #fetch(ProgressMonitor, Collection, Set)} makes before sending a
+	 * filter, under any protocol version.
+	 * <p>
+	 * Under V2 only the tokens of the {@code fetch} line in the capability
+	 * advertisement count, so the features V2 makes implicit (thin-pack,
+	 * ofs-delta, include-tag, no-progress) and the top-level ones (agent,
+	 * object-format) answer {@code false}, while under V0 they answer
+	 * {@code true} when advertised.
+	 * <p>
+	 * Transports that read no capability advertisement return {@code false}.
+	 * <p>
+	 * Added in the GIJ Cloud fork; not part of upstream JGit API.
+	 *
+	 * @param capability
+	 *            capability name, for example
+	 *            {@link GitProtocolConstants#OPTION_FILTER}
+	 * @return {@code true} if the remote advertised the capability for fetch
+	 */
+	default boolean isFetchCapabilityAdvertised(String capability) {
+		return false;
+	}
+	// BBB customization end
 }
