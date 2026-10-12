@@ -350,6 +350,16 @@ public abstract class BasePackFetchConnection extends BasePackConnection
 		doFetch(monitor, want, have, outputStream);
 	}
 
+	// BBB customization begin
+	@Override
+	public boolean isFetchCapabilityAdvertised(String capability) {
+		if (TransferConfig.ProtocolVersion.V2.equals(getProtocolVersion())) {
+			return getAdvertisedFetchCapabilitiesV2().contains(capability);
+		}
+		return isCapableOf(capability);
+	}
+	// BBB customization end
+
 	@Override
 	public boolean didFetchIncludeTags() {
 		return false;
@@ -471,11 +481,9 @@ public abstract class BasePackFetchConnection extends BasePackConnection
 			pckState.writeString(
 					GitProtocolConstants.OPTION_AGENT + '=' + agent);
 		}
-		Set<String> capabilities = new HashSet<>();
-		String advertised = getCapability(GitProtocolConstants.COMMAND_FETCH);
-		if (!StringUtils.isEmptyOrNull(advertised)) {
-			capabilities.addAll(Arrays.asList(advertised.split("\\s+"))); //$NON-NLS-1$
-		}
+		// BBB customization begin
+		Set<String> capabilities = getAdvertisedFetchCapabilitiesV2();
+		// BBB customization end
 		// Arguments
 		pckState.writeDelim();
 		for (String capability : getCapabilitiesV2(capabilities)) {
@@ -820,6 +828,17 @@ public abstract class BasePackFetchConnection extends BasePackConnection
 		}
 		return true;
 	}
+
+	// BBB customization begin
+	private Set<String> getAdvertisedFetchCapabilitiesV2() {
+		Set<String> capabilities = new HashSet<>();
+		String advertised = getCapability(GitProtocolConstants.COMMAND_FETCH);
+		if (!StringUtils.isEmptyOrNull(advertised)) {
+			capabilities.addAll(Arrays.asList(advertised.split("\\s+"))); //$NON-NLS-1$
+		}
+		return capabilities;
+	}
+	// BBB customization end
 
 	private Set<String> getCapabilitiesV2(Set<String> advertisedCapabilities)
 			throws TransportException {
