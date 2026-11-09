@@ -42,15 +42,57 @@
 
 package org.eclipse.jgit.transport;
 
+import java.util.ArrayList;
+
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 
 import org.eclipse.jgit.errors.PackProtocolException;
+import org.eclipse.jgit.internal.JGitText;
+import org.eclipse.jgit.internal.storage.dfs.DfsRepositoryDescription;
+import org.eclipse.jgit.internal.storage.dfs.InMemoryRepository;
+import org.eclipse.jgit.junit.TestRepository;
+import org.eclipse.jgit.junit.TestRepository.BranchBuilder;
+import org.eclipse.jgit.lib.NullProgressMonitor;
 import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.transport.ReceiveCommand.Result;
+import org.eclipse.jgit.lib.Repository;
+import org.eclipse.jgit.revwalk.RevCommit;
+import org.junit.After;
+import org.junit.Before;
 import org.junit.Test;
 
 /** Tests for receive-pack utilities. */
 public class ReceivePackTest {
+	private URIish uri;
+	private TestProtocol<Object> testProtocol;
+	private InMemoryRepository client;
+	private InMemoryRepository server;
+	private TestRepository clientTestRepo;
+	private TestRepository serverTestRepo;
+
+	@Before
+	public void setUp() throws Exception {
+		client = new InMemoryRepository(new DfsRepositoryDescription("client"));
+		server = new InMemoryRepository(new DfsRepositoryDescription("server"));
+		clientTestRepo = new TestRepository<>(client);
+		serverTestRepo = new TestRepository<>(server);
+
+		testProtocol = new TestProtocol<>(null, (Object req, Repository db) -> {
+			ReceivePack rp = new ReceivePack(db);
+			return rp;
+		});
+		uri = testProtocol.register(new Object(), server);
+	}
+
+	@After
+	public void tearDown() {
+		Transport.unregister(testProtocol);
+	}
+
 	@Test
 	public void parseCommand() throws Exception {
 		String o = "0000000000000000000000000000000000000000";
@@ -74,6 +116,54 @@ public class ReceivePackTest {
 		assertParseCommandFails(o + " " + "X" + n.substring(1) + " " + r);
 	}
 
+	/**
+	 * Ensure receive-pack rejects a push to a one level ref (refs/master).
+	 */
+	@Test
+	public void rejectsCreationOfOneLevelRef() throws Exception {
+		// Create refs/master on the client so we can attempt to push it
+		RevCommit clientCommit;
+		BranchBuilder bb = clientTestRepo.branch("refs/master");
+		clientCommit = bb.commit().noFiles().message("Testing").create();
+
+		ArrayList<RemoteRefUpdate> refUpdates = new ArrayList<>();
+		refUpdates.add(new RemoteRefUpdate(
+				clientTestRepo.getRepository(), "refs/master", clientCommit,
+				"refs/master", false, /* force update */
+				null, /* no local tracking ref */
+				ObjectId.zeroId() // expected advertisement
+		));
+		Transport tn = testProtocol.open(uri, client, "server");
+		PushResult result = tn.push(NullProgressMonitor.INSTANCE, refUpdates);
+		RemoteRefUpdate update = result.getRemoteUpdate("refs/master");
+
+		assertEquals(RemoteRefUpdate.Status.REJECTED_OTHER_REASON,
+				update.getStatus());
+		assertEquals(JGitText.get().funnyRefname, update.getMessage());
+	}
+
+	/**
+	 * Allow deletion of one level refs (refs/master).
+	 */
+	@Test
+	public void acceptsDeletionOfOneLevelRef() throws Exception {
+		BranchBuilder bb = serverTestRepo.branch("refs/master");
+		bb.update(bb.commit().noFiles().message("Testing").create());
+
+		ArrayList<RemoteRefUpdate> refUpdates = new ArrayList<>();
+		refUpdates.add(new RemoteRefUpdate(null, null, ObjectId.zeroId(),
+				"refs/master", false, // force update
+				null, // no local tracking ref
+				null // expected advertisement
+		));
+		Transport tn = testProtocol.open(uri, client, "server");
+		PushResult result = tn.push(NullProgressMonitor.INSTANCE, refUpdates);
+		RemoteRefUpdate update = result.getRemoteUpdate("refs/master");
+
+		assertEquals(RemoteRefUpdate.Status.OK, update.getStatus());
+		assertEquals(null, update.getMessage());
+	}
+
 	private void assertParseCommandFails(String input) {
 		try {
 			ReceivePack.parseCommand(input);
@@ -81,5 +171,63 @@ public class ReceivePackTest {
 		} catch (PackProtocolException e) {
 			// Expected.
 		}
+	}
+
+	@Test
+	public void testCertificatePushOptionsMismatch() throws Exception {
+		ReceiveCommand cmd1 = new ReceiveCommand(
+				ObjectId.fromString("0000000000000000000000000000000000000000"),
+				ObjectId.fromString("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+				"refs/heads/master");
+		ReceiveCommand cmd2 = new ReceiveCommand(
+				ObjectId.fromString("0000000000000000000000000000000000000000"),
+				ObjectId.fromString("badc0ffebadc0ffebadc0ffebadc0ffebadc0ffe"),
+				"refs/heads/branch");
+
+		List<ReceiveCommand> commands = new ArrayList<>();
+		commands.add(cmd1);
+		commands.add(cmd2);
+
+		ReceivePack.validateCertificatePushOptions(
+				Arrays.asList("option1", "option2"),
+				Arrays.asList("option1", "different"), commands);
+
+		assertEquals(Result.REJECTED_OTHER_REASON, cmd1.getResult());
+		assertEquals(Result.REJECTED_OTHER_REASON, cmd2.getResult());
+		assertEquals(JGitText.get().pushCertificateInconsistentPushOptions,
+				cmd1.getMessage());
+		assertEquals(JGitText.get().pushCertificateInconsistentPushOptions,
+				cmd2.getMessage());
+	}
+
+	@Test
+	public void testCertificatePushOptionsMatch() throws Exception {
+		ReceiveCommand cmd = new ReceiveCommand(
+				ObjectId.fromString("0000000000000000000000000000000000000000"),
+				ObjectId.fromString("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+				"refs/heads/master");
+
+		List<ReceiveCommand> commands = Collections.singletonList(cmd);
+
+		ReceivePack.validateCertificatePushOptions(
+				Arrays.asList("option1", "option2"),
+				Arrays.asList("option1", "option2"), commands);
+
+		assertEquals(Result.NOT_ATTEMPTED, cmd.getResult());
+	}
+
+	@Test
+	public void testCertificatePushOptionsNullTreatedAsEmpty() throws Exception {
+		ReceiveCommand cmd = new ReceiveCommand(
+				ObjectId.fromString("0000000000000000000000000000000000000000"),
+				ObjectId.fromString("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+				"refs/heads/master");
+
+		List<ReceiveCommand> commands = Collections.singletonList(cmd);
+
+		ReceivePack.validateCertificatePushOptions(Collections.emptyList(),
+				null, commands);
+
+		assertEquals(Result.NOT_ATTEMPTED, cmd.getResult());
 	}
 }

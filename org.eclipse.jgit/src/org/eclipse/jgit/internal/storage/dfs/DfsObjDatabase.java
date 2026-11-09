@@ -13,13 +13,14 @@ package org.eclipse.jgit.internal.storage.dfs;
 import static java.util.stream.Collectors.joining;
 import static org.eclipse.jgit.internal.storage.pack.PackExt.BITMAP_INDEX;
 import static org.eclipse.jgit.internal.storage.pack.PackExt.INDEX;
+import static org.eclipse.jgit.internal.storage.pack.PackExt.MULTI_PACK_INDEX;
+import static org.eclipse.jgit.internal.storage.pack.PackExt.REFTABLE;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -27,13 +28,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import org.eclipse.jgit.internal.storage.file.BasePackIndexWriter;
 import org.eclipse.jgit.internal.storage.file.PackBitmapIndexWriterV1;
-import org.eclipse.jgit.internal.storage.pack.PackIndexWriter;
 import org.eclipse.jgit.internal.storage.pack.PackBitmapIndexWriter;
 import org.eclipse.jgit.internal.storage.pack.PackExt;
+import org.eclipse.jgit.internal.storage.pack.PackIndexWriter;
 import org.eclipse.jgit.lib.AnyObjectId;
+import org.eclipse.jgit.lib.ConfigConstants;
 import org.eclipse.jgit.lib.ObjectDatabase;
 import org.eclipse.jgit.lib.ObjectInserter;
 import org.eclipse.jgit.lib.ObjectReader;
@@ -88,6 +91,12 @@ public abstract class DfsObjDatabase extends ObjectDatabase {
 		COMPACT,
 
 		/**
+		 * Pack was created by Git incremental garbage collection from
+		 * heads/tags.
+		 */
+		GC_PART,
+
+		/**
 		 * Pack was created by Git garbage collection by this implementation.
 		 * <p>
 		 * This source is only used by the {@link DfsGarbageCollector} when it
@@ -97,6 +106,9 @@ public abstract class DfsObjDatabase extends ObjectDatabase {
 		 * @see DfsGarbageCollector
 		 */
 		GC,
+
+		/** Created from non-heads by incremental garbage collection. */
+		GC_REST_PART,
 
 		/** Created from non-heads by {@link DfsGarbageCollector}. */
 		GC_REST,
@@ -121,7 +133,9 @@ public abstract class DfsObjDatabase extends ObjectDatabase {
 				new ComparatorBuilder()
 						.add(INSERT, RECEIVE)
 						.add(COMPACT)
+						.add(GC_PART)
 						.add(GC)
+						.add(GC_REST_PART)
 						.add(GC_REST)
 						.add(UNREACHABLE_GARBAGE)
 						.build();
@@ -198,6 +212,8 @@ public abstract class DfsObjDatabase extends ObjectDatabase {
 
 	private Comparator<DfsPackDescription> packComparator;
 
+	private boolean useMultipackIndex;
+
 	/**
 	 * Initialize an object database for our repository.
 	 *
@@ -212,6 +228,9 @@ public abstract class DfsObjDatabase extends ObjectDatabase {
 		this.packList = new AtomicReference<>(NO_PACKS);
 		this.readerOptions = options;
 		this.packComparator = DfsPackDescription.objectLookupComparator();
+		this.useMultipackIndex = repository.getConfig().getBoolean(
+				ConfigConstants.CONFIG_CORE_SECTION,
+				ConfigConstants.CONFIG_KEY_MULTIPACKINDEX, false);
 	}
 
 	/**
@@ -246,6 +265,28 @@ public abstract class DfsObjDatabase extends ObjectDatabase {
 	@Override
 	public ObjectInserter newInserter() {
 		return new DfsInserter(this);
+	}
+
+	/**
+	 * Whether to use multipack indexes in the list of packs
+	 * <p>
+	 * This overrides the value in the core.multiPackIndex config key read at
+	 * construction time.
+	 *
+	 * @param value
+	 *            value to set in the flag
+	 */
+	public void setUseMultipackIndex(boolean value) {
+		this.useMultipackIndex = value;
+	}
+
+	/**
+	 * Should this object db return multipack indexes
+	 *
+	 * @return current value of the flag
+	 */
+	protected boolean useMultipackIndex() {
+		return this.useMultipackIndex;
 	}
 
 	/**
@@ -420,6 +461,9 @@ public abstract class DfsObjDatabase extends ObjectDatabase {
 
 	/**
 	 * Implementation of pack commit.
+	 * <p>
+	 * Implementations must take care to clean up midxs that become invalid when
+	 * any of their covered packs is replaced.
 	 *
 	 * @see #commitPack(Collection, Collection)
 	 * @param desc
@@ -455,6 +499,11 @@ public abstract class DfsObjDatabase extends ObjectDatabase {
 	 * The returned list must support random access and must be mutable by the
 	 * caller. It is sorted in place using the natural sorting of the returned
 	 * DfsPackDescription objects.
+	 * <p>
+	 * With multipack index enabled, this method returns the descriptions of the
+	 * multipack index(es) (which include descriptions of covered packs) and of
+	 * packs not covered by the midxs. With multipack index disabled, it returns
+	 * only regular packs (the midx is just ignored).
 	 *
 	 * @return available packs. May be empty if there are no packs.
 	 * @throws java.io.IOException
@@ -574,25 +623,56 @@ public abstract class DfsObjDatabase extends ObjectDatabase {
 	}
 
 	private PackList scanPacksImpl(PackList old) throws IOException {
-		DfsBlockCache cache = DfsBlockCache.getInstance();
+		List<DfsPackDescription> scanned = useMultipackIndex()
+				? MidxPackFilter.useMidx(listPacks())
+				: MidxPackFilter.skipMidxs(listPacks());
+		scanned.sort(packComparator);
+		return descTreeToPackList(scanned, old);
+	}
+
+	/**
+	 * Translate the valid list of descriptions (with midx as trees of packs)
+	 * into DfsPackFile and DfsReftable instances
+	 *
+	 * @param descTree
+	 *            a valid list of descriptions, may contain midx. Covered packs
+	 *            and nested midxs are NOT in the top level list.
+	 * @return a packlist with the new/reused DfsPackFile instances
+	 */
+	public PackList descTreeToPackList(List<DfsPackDescription> descTree) {
+		return descTreeToPackList(descTree, NO_PACKS);
+	}
+
+	private PackList descTreeToPackList(List<DfsPackDescription> descTree,
+			PackList old) {
 		Map<DfsPackDescription, DfsPackFile> packs = packMap(old);
 		Map<DfsPackDescription, DfsReftable> reftables = reftableMap(old);
 
-		List<DfsPackDescription> scanned = listPacks();
-		Collections.sort(scanned, packComparator);
-
-		List<DfsPackFile> newPacks = new ArrayList<>(scanned.size());
-		List<DfsReftable> newReftables = new ArrayList<>(scanned.size());
+		DfsBlockCache cache = DfsBlockCache.getInstance();
+		List<DfsPackFile> newPacks = new ArrayList<>(descTree.size());
+		List<DfsPackDescription> packsWithReftables = new ArrayList<>();
 		boolean foundNew = false;
-		for (DfsPackDescription dsc : scanned) {
+		for (DfsPackDescription dsc : descTree) {
 			DfsPackFile oldPack = packs.remove(dsc);
 			if (oldPack != null) {
 				newPacks.add(oldPack);
 			} else if (dsc.hasFileExt(PackExt.PACK)) {
 				newPacks.add(createDfsPackFile(cache, dsc));
 				foundNew = true;
+			} else if (dsc.hasFileExt(MULTI_PACK_INDEX)) {
+				newPacks.add(
+						createDfsPackFileMidx(cache, dsc, packsWithReftables));
+				foundNew = true;
 			}
 
+			if (dsc.hasFileExt(REFTABLE)) {
+				packsWithReftables.add(dsc);
+			}
+		}
+
+		List<DfsReftable> newReftables = new ArrayList<>(
+				packsWithReftables.size());
+		for (DfsPackDescription dsc : packsWithReftables) {
 			DfsReftable oldReftable = reftables.remove(dsc);
 			if (oldReftable != null) {
 				newReftables.add(oldReftable);
@@ -607,7 +687,7 @@ public abstract class DfsObjDatabase extends ObjectDatabase {
 		if (!foundNew) {
 			return old;
 		}
-		Collections.sort(newReftables, reftableComparator());
+		newReftables.sort(reftableComparator());
 		return new PackList(
 				newPacks.toArray(new DfsPackFile[0]),
 				newReftables.toArray(new DfsReftable[0]));
@@ -615,7 +695,7 @@ public abstract class DfsObjDatabase extends ObjectDatabase {
 
 	/**
 	 * Create instances of DfsPackFile
-	 *
+	 * <p>
 	 * Implementors can decide to construct or wrap DfsPackFile in different
 	 * ways.
 	 *
@@ -625,9 +705,41 @@ public abstract class DfsObjDatabase extends ObjectDatabase {
 	 *            pack description
 	 * @return the dfs packfile
 	 */
-	protected DfsPackFile createDfsPackFile(DfsBlockCache cache,
+	public DfsPackFile createDfsPackFile(DfsBlockCache cache,
 			DfsPackDescription dsc) {
 		return new DfsPackFile(cache, dsc);
+	}
+
+	/**
+	 * Create instances of DfsPackFileMidx
+	 *
+	 * @param cache
+	 *            block cache
+	 * @param dsc
+	 *            pack description
+	 * @param containsReftables
+	 *            used to return packs inside this midx that also have reftables
+	 *
+	 * @return the dfs packfile
+	 */
+	protected DfsPackFileMidx createDfsPackFileMidx(DfsBlockCache cache,
+			DfsPackDescription dsc,
+			List<DfsPackDescription> containsReftables) {
+		DfsPackFileMidx base = null;
+		if (dsc.getMultiPackIndexBase() != null) {
+			// The base is always a multipack index
+			base = createDfsPackFileMidx(cache, dsc.getMultiPackIndexBase(),
+					containsReftables);
+		}
+		// A pack shouldn't be in the pack list and inside a multipack index
+		// at the same time. In that case, we will have it under two
+		// different DfsPackFile instances.
+		List<DfsPackFile> coveredPacks = dsc.getCoveredPacks().stream()
+				.map(desc -> createDfsPackFile(cache, desc))
+				.collect(Collectors.toUnmodifiableList());
+		dsc.getCoveredPacks().stream().filter(d -> d.hasFileExt(REFTABLE))
+				.forEach(containsReftables::add);
+		return DfsPackFileMidx.create(cache, dsc, coveredPacks, base);
 	}
 
 	private static Map<DfsPackDescription, DfsPackFile> packMap(PackList old) {

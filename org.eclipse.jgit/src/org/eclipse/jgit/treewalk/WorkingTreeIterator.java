@@ -2,7 +2,7 @@
  * Copyright (C) 2008, Shawn O. Pearce <spearce@spearce.org>
  * Copyright (C) 2010, Christian Halstrick <christian.halstrick@sap.com>
  * Copyright (C) 2010, Matthias Sohn <matthias.sohn@sap.com>
- * Copyright (C) 2012, 2022, Robin Rosenberg and others
+ * Copyright (C) 2012, 2026, Robin Rosenberg and others
  *
  * This program and the accompanying materials are made available under the
  * terms of the Eclipse Distribution License v. 1.0 which is available at
@@ -784,13 +784,17 @@ public abstract class WorkingTreeIterator extends AbstractTreeIterator {
 				continue;
 			if (Constants.DOT_GIT.equals(name))
 				continue;
-			if (Constants.DOT_GIT_IGNORE.equals(name))
+			if (Constants.DOT_GIT_IGNORE.equals(name)
+					&& isAcceptableFile(e.getMode())) {
 				ignoreNode = new PerDirectoryIgnoreNode(
 						TreeWalk.pathOf(path, 0, pathOffset)
 								+ Constants.DOT_GIT_IGNORE,
 						e);
-			if (Constants.DOT_GIT_ATTRIBUTES.equals(name))
+			}
+			if (Constants.DOT_GIT_ATTRIBUTES.equals(name)
+					&& isAcceptableFile(e.getMode())) {
 				attributesNode = new PerDirectoryAttributesNode(e);
+			}
 			if (i != o)
 				entries[o] = e;
 			e.encodeName(nameEncoder);
@@ -805,6 +809,13 @@ public abstract class WorkingTreeIterator extends AbstractTreeIterator {
 			parseEntry();
 		else if (pathLen == 0) // see bug 445363
 			pathLen = pathOffset;
+	}
+
+	private static boolean isAcceptableFile(FileMode mode) {
+		// An executable .gitignore doesn't make much sense but we accepted
+		// it before. Keep it for backwards compatibility.
+		return FileMode.REGULAR_FILE.equals(mode)
+				|| FileMode.EXECUTABLE_FILE.equals(mode);
 	}
 
 	/**
@@ -1293,7 +1304,8 @@ public abstract class WorkingTreeIterator extends AbstractTreeIterator {
 			FS fs = repository.getFS();
 			Path path = repository.getConfig().getPath(
 					ConfigConstants.CONFIG_CORE_SECTION, null,
-					ConfigConstants.CONFIG_KEY_EXCLUDESFILE, fs, null, null);
+					ConfigConstants.CONFIG_KEY_EXCLUDESFILE, fs,
+					repository.getWorkTree(), null);
 			if (path != null) {
 				if (Files.exists(path)) {
 					loadRulesFromFile(coreExclude, path.toFile());

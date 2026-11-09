@@ -1458,7 +1458,10 @@ public abstract class Transport implements AutoCloseable {
 		new FetchProcess(this, toFetch).execute(monitor, result, branch);
 
 		// BBB customization begin
+		// if (local.getConfig().getBoolean(ConfigConstants.CONFIG_FETCH_SECTION,
+		// ConfigConstants.CONFIG_KEY_AUTOGC, true)) {
 		// local.autoGC(monitor);
+		// }
 		// BBB customization end
 
 		return result;

@@ -824,10 +824,16 @@ public final class ConfigConstants {
 	public static final String CONFIG_KEY_BITMAP_INACTIVE_BRANCH_AGE_INDAYS = "bitmapinactivebranchageindays";
 
 	/**
-	 * The "pack.bitmapRecentCommitSpan" key
+	 * The "pack.bitmapRecentCommitCount" key
 	 * @since 5.8
 	 */
-	public static final String CONFIG_KEY_BITMAP_RECENT_COMMIT_COUNT = "bitmaprecentcommitspan";
+	public static final String CONFIG_KEY_BITMAP_RECENT_COMMIT_COUNT = "bitmaprecentcommitcount";
+
+	/**
+	 * The "pack.bitmapRecentCommitSpan" key
+	 * @since 7.8
+	 */
+	public static final String CONFIG_KEY_BITMAP_RECENT_COMMIT_SPAN = "bitmaprecentcommitspan";
 
 	/**
 	 * The "pack.writeReverseIndex" key
@@ -1115,4 +1121,18 @@ public final class ConfigConstants {
 	 * @since 7.2
 	 */
 	public static final String CONFIG_KEY_AUTOREFRESH = "autorefresh";
+
+	/**
+	 * The "multiPackIndex" key
+	 *
+	 * @since 7.5
+	 */
+	public static final String CONFIG_KEY_MULTIPACKINDEX = "multiPackIndex";
+
+	/**
+	 * The "packRefs" key
+	 *
+	 * @since 7.6
+	 */
+	public static final String CONFIG_KEY_PACK_REFS = "packRefs";
 }

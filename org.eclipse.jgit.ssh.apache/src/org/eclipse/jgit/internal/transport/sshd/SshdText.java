@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018, 2024 Thomas Wolf <twolf@apache.org> and others
+ * Copyright (C) 2018, 2025 Thomas Wolf <twolf@apache.org> and others
  *
  * This program and the accompanying materials are made available under the
  * terms of the Eclipse Distribution License v. 1.0 which is available at
@@ -91,6 +91,7 @@ public final class SshdText extends TranslationBundle {
 	/***/ public String knownHostsUserAskCreationMsg;
 	/***/ public String knownHostsUserAskCreationPrompt;
 	/***/ public String loginDenied;
+	/***/ public String noExplicitKeys;
 	/***/ public String passwordPrompt;
 	/***/ public String pkcs11Error;
 	/***/ public String pkcs11FailedInstantiation;
@@ -102,7 +103,9 @@ public final class SshdText extends TranslationBundle {
 	/***/ public String pkcs11Warning;
 	/***/ public String proxyCannotAuthenticate;
 	/***/ public String proxyHttpFailure;
+	/***/ public String proxyHttpHeadersTooLong;
 	/***/ public String proxyHttpInvalidUserName;
+	/***/ public String proxyHttpMessageTooLong;
 	/***/ public String proxyHttpUnexpectedReply;
 	/***/ public String proxyHttpUnspecifiedFailureReason;
 	/***/ public String proxyJumpAbort;
@@ -209,7 +212,6 @@ public final class SshdText extends TranslationBundle {
 	/***/ public String signSignatureError;
 	/***/ public String signStderr;
 	/***/ public String signTooManyPrivateKeys;
-	/***/ public String signTooManyPublicKeys;
 	/***/ public String signUnknownHashAlgorithm;
 	/***/ public String signUnknownSignatureAlgorithm;
 	/***/ public String signWrongNamespace;

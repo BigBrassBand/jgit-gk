@@ -402,15 +402,28 @@ public class FileReftableDatabase extends RefDatabase {
 				true);
 	}
 
-	private boolean addReftable(FileReftableStack.Writer w) throws IOException {
-		if (!reftableStack.addReftable(w)) {
-			reftableStack.reload();
+	// Visible for testing
+	boolean addReftable(FileReftableStack.Writer w) throws IOException {
+		// reload() can close a table reader used by reftableDatabase's cached
+		// merged table. Hold its reader lock so a ref lookup cannot use that table
+		// while reload() runs.
+		ReentrantLock lock = getLock();
+		lock.lock();
+		try {
+			if (!reftableStack.addReftable(w)) {
+				reftableStack.reload();
+				return false;
+			}
+			return true;
+		} finally {
 			reftableDatabase.clearCache();
-			return false;
+			lock.unlock();
 		}
-		reftableDatabase.clearCache();
+	}
 
-		return true;
+	// Visible for testing
+	ReftableDatabase getReftableDatabase() {
+		return reftableDatabase;
 	}
 
 	private class FileReftableBatchRefUpdate extends ReftableBatchRefUpdate {
@@ -622,9 +635,7 @@ public class FileReftableDatabase extends RefDatabase {
 		if (writeLogs) {
 			for (Ref r : refs) {
 				ReflogReader rlr = refDb.getReflogReader(r);
-				if (rlr != null) {
-					size = Math.max(rlr.getReverseEntries().size(), size);
-				}
+				size = Math.max(rlr.getReverseEntries().size(), size);
 			}
 		}
 		// We must use 1 here, nextUpdateIndex() on the empty stack is 1.

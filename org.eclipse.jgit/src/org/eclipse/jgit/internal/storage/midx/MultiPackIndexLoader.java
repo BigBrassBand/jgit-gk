@@ -112,7 +112,8 @@ public class MultiPackIndexLoader {
 		int v = hdr[4];
 		if (v != 1) {
 			throw new MultiPackIndexFormatException(MessageFormat
-					.format(JGitText.get().unsupportedMIDXVersion, v));
+					.format(JGitText.get().unsupportedMIDXVersion,
+							Integer.valueOf(v)));
 		}
 
 		// Read the object Id version (1 byte)
@@ -161,7 +162,8 @@ public class MultiPackIndexLoader {
 
 			if (len > Integer.MAX_VALUE - 8) { // http://stackoverflow.com/a/8381338
 				throw new MultiPackIndexFormatException(
-						JGitText.get().multiPackIndexFileIsTooLargeForJgit);
+						MessageFormat.format(JGitText.get().midxChunkTooBig,
+								chunkId, len));
 			}
 
 			byte[] buffer = new byte[(int) len];
@@ -186,11 +188,17 @@ public class MultiPackIndexLoader {
 			case MIDX_CHUNKID_LARGEOFFSETS:
 				builder.addObjectLargeOffsets(buffer);
 				break;
+			case MIDX_CHUNKID_REVINDEX:
+				builder.addReverseIndex(buffer);
+				break;
 			default:
 				LOG.warn(MessageFormat.format(JGitText.get().midxChunkUnknown,
 						Integer.toHexString(chunkId)));
 			}
 		}
+		byte[] checksum = new byte[20];
+		IO.readFully(fd, checksum, 0, 20);
+		builder.addChecksum(checksum);
 		return builder.build();
 	}
 
@@ -221,6 +229,8 @@ public class MultiPackIndexLoader {
 
 		// Optional
 		private byte[] bitmapPackOrder;
+
+		private byte[] checksum;
 
 		private MultiPackIndexBuilder(int hashLength) {
 			this.hashLength = hashLength;
@@ -299,7 +309,8 @@ public class MultiPackIndexLoader {
 
 			assertPackCounts(packCount, packNames.length);
 			return new MultiPackIndexV1(hashLength, oidFanout, oidLookup,
-					packNames, bitmappedPackfiles, objectOffsets, largeObjectOffsets);
+					packNames, bitmappedPackfiles, objectOffsets,
+					largeObjectOffsets, bitmapPackOrder, checksum);
 		}
 
 		private static void assertChunkNotNull(Object object, int chunkId)
@@ -325,8 +336,13 @@ public class MultiPackIndexLoader {
 			if (headerCount != packfileNamesCount) {
 				throw new MultiPackIndexFormatException(MessageFormat.format(
 						JGitText.get().multiPackIndexPackCountMismatch,
-						headerCount, packfileNamesCount));
+						Integer.valueOf(headerCount),
+						Integer.valueOf(packfileNamesCount)));
 			}
+		}
+
+		public void addChecksum(byte[] checksum) {
+			this.checksum = checksum;
 		}
 	}
 

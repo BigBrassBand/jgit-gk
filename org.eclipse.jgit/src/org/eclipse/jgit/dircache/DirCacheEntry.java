@@ -411,9 +411,14 @@ public class DirCacheEntry {
 		// it is clean or not based on the modification time alone.
 		//
 		final int base = infoOffset + P_MTIME;
-		final int mtime = NB.decodeInt32(info, base);
-		if ((int) smudge.getEpochSecond() == mtime) {
-			return smudge.getNano() <= NB.decodeInt32(info, base + 4);
+		final int entryMtimeSec = NB.decodeInt32(info, base);
+		final int smudgeSec = (int) smudge.getEpochSecond();
+		if (smudgeSec != 0) {
+			if (smudgeSec < entryMtimeSec) {
+				return true;
+			} else if (smudgeSec == entryMtimeSec) {
+				return smudge.getNano() <= NB.decodeInt32(info, base + 4);
+			}
 		}
 		return false;
 	}
@@ -449,7 +454,9 @@ public class DirCacheEntry {
 	 */
 	public final boolean isSmudged() {
 		final int base = infoOffset + P_OBJECTID;
-		return (getLength() == 0) && (Constants.EMPTY_BLOB_ID.compareTo(info, base) != 0);
+		return (getLength() == 0)
+				&& !FileMode.GITLINK.equals(getFileMode())
+				&& (Constants.EMPTY_BLOB_ID.compareTo(info, base) != 0);
 	}
 
 	final byte[] idBuffer() {

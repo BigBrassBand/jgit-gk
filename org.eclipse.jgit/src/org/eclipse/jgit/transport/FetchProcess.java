@@ -46,12 +46,18 @@ import org.eclipse.jgit.lib.ObjectIdRef;
 import org.eclipse.jgit.lib.ProgressMonitor;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.RefDatabase;
+import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.ObjectWalk;
 import org.eclipse.jgit.revwalk.RevObject;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.util.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 class FetchProcess {
+	private static final Logger LOG = LoggerFactory
+			.getLogger(FetchProcess.class);
+
 	/** Transport we will fetch over. */
 	private final Transport transport;
 
@@ -139,6 +145,18 @@ class FetchProcess {
 		final TagOpt tagopt = transport.getTagOpt();
 		String getTags = (tagopt == TagOpt.NO_TAGS) ? null : Constants.R_TAGS;
 		String getHead = null;
+		// Snapshot local refs before opening the fetch connection when the
+		// fetch has positive refspecs or may run AUTO_FOLLOW. Those are the
+		// paths that can later create TrackingRefUpdates from this fetch and
+		// need a stable expected-old-id baseline to turn concurrent local ref
+		// changes into LOCK_FAILURE.
+		//
+		// Skip the snapshot for the remaining cases to avoid an unnecessary
+		// local ref scan when this fetch cannot reach those update paths.
+		if (!toFetch.isEmpty() || tagopt == TagOpt.AUTO_FOLLOW) {
+			localRefs();
+		}
+
 		try {
 			// If we don't have a HEAD yet, we're cloning and need to get the
 			// upstream HEAD, too.
@@ -235,10 +253,23 @@ class FetchProcess {
 			addUpdateBatchCommands(result, batch);
 			for (ReceiveCommand cmd : batch.getCommands()) {
 				cmd.updateType(walk);
-				if (cmd.getType() == UPDATE_NONFASTFORWARD
-						&& cmd instanceof TrackingRefUpdate.Command
-						&& !((TrackingRefUpdate.Command) cmd).canForceUpdate())
+				if (!(cmd instanceof TrackingRefUpdate.Command)
+						|| ((TrackingRefUpdate.Command) cmd).canForceUpdate()) {
+					continue;
+				}
+
+				ObjectId currentId = currentObjectId(cmd.getRefName());
+				// The initial type check used the ref value snapshotted when
+				// the fetch started. If the local ref moved since then,
+				// re-check the non-fast-forward against the current ref before
+				// executing the batch so non-forced rejects remain REJECTED
+				// instead of surfacing as LOCK_FAILURE.
+				ReceiveCommand refreshedCmd = new ReceiveCommand(currentId,
+						cmd.getNewId(), cmd.getRefName());
+				refreshedCmd.updateType(walk);
+				if (refreshedCmd.getType() == UPDATE_NONFASTFORWARD) {
 					cmd.setResult(REJECTED_NONFASTFORWARD);
+				}
 			}
 			if (transport.isDryRun()) {
 				for (ReceiveCommand cmd : batch.getCommands()) {
@@ -525,6 +556,16 @@ class FetchProcess {
 					src.getName()));
 		}
 		if (spec.getDestination() != null) {
+			if (!isValidFetchDestination(spec.getDestination())) {
+				// Drop an invalid expanded destination before it becomes a ref
+				// update, an object request, or a FETCH_HEAD entry. Warn so the
+				// drop is visible, like native git's "Ignoring funny ref"
+				// message.
+				LOG.warn(MessageFormat.format(
+						JGitText.get().ignoringFunnyRefLocally,
+						spec.getDestination()));
+				return;
+			}
 			final TrackingRefUpdate tru = createUpdate(spec, newId);
 			// if depth is set we need to update the ref
 			if (newId.equals(tru.getOldObjectId()) && transport.getDepth() == null) {
@@ -546,6 +587,23 @@ class FetchProcess {
 	private void want(ObjectId id) {
 		askFor.put(id,
 				new ObjectIdRef.Unpeeled(Ref.Storage.NETWORK, id.name(), id));
+	}
+
+	/**
+	 * Checks whether an expanded local fetch destination is safe to store.
+	 * <p>
+	 * Matches native git's {@code get_fetch_map()} rule: the destination must
+	 * live under {@code refs/} and be a valid ref name. A wildcard refspec
+	 * copies the matched part of the remote name verbatim into the destination,
+	 * so a hostile remote could otherwise introduce path-traversal components.
+	 *
+	 * @param name
+	 *            expanded local destination from a fetch refspec.
+	 * @return {@code true} if it is safe to turn into a local ref update.
+	 */
+	private static boolean isValidFetchDestination(String name) {
+		return name.startsWith(Constants.R_REFS)
+				&& Repository.isValidRefName(name);
 	}
 
 	private TrackingRefUpdate createUpdate(RefSpec spec, ObjectId newId)
@@ -572,6 +630,14 @@ class FetchProcess {
 			}
 		}
 		return localRefs;
+	}
+
+	private ObjectId currentObjectId(String refName) throws IOException {
+		Ref current = transport.local.exactRef(refName);
+		if (current == null) {
+			return ObjectId.zeroId();
+		}
+		return current.getObjectId();
 	}
 
 	private void deleteStaleTrackingRefs(FetchResult result,

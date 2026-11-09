@@ -37,12 +37,14 @@ import java.util.zip.CRC32;
 import java.util.zip.DataFormatException;
 import java.util.zip.Inflater;
 
+import org.eclipse.jgit.annotations.NonNull;
 import org.eclipse.jgit.errors.CorruptObjectException;
 import org.eclipse.jgit.errors.LargeObjectException;
 import org.eclipse.jgit.errors.MissingObjectException;
 import org.eclipse.jgit.errors.PackInvalidException;
 import org.eclipse.jgit.errors.StoredObjectRepresentationNotAvailableException;
 import org.eclipse.jgit.internal.JGitText;
+import org.eclipse.jgit.internal.storage.commitgraph.ChangedPathFilter;
 import org.eclipse.jgit.internal.storage.commitgraph.CommitGraph;
 import org.eclipse.jgit.internal.storage.commitgraph.CommitGraphLoader;
 import org.eclipse.jgit.internal.storage.file.PackBitmapIndex;
@@ -57,9 +59,11 @@ import org.eclipse.jgit.internal.storage.pack.PackOutputStream;
 import org.eclipse.jgit.internal.storage.pack.StoredObjectRepresentation;
 import org.eclipse.jgit.lib.AbbreviatedObjectId;
 import org.eclipse.jgit.lib.AnyObjectId;
+import org.eclipse.jgit.lib.BitmapIndex;
 import org.eclipse.jgit.lib.ConfigConstants;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.ObjectIdSet;
 import org.eclipse.jgit.lib.ObjectLoader;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.lib.StoredConfig;
@@ -71,12 +75,15 @@ import org.eclipse.jgit.util.LongList;
  * delta packed format yielding high compression of lots of object where some
  * objects are similar.
  */
-public final class DfsPackFile extends BlockBasedFile {
+public sealed class DfsPackFile extends BlockBasedFile permits DfsPackFileMidx {
 	private static final int REC_SIZE = Constants.OBJECT_ID_LENGTH + 8;
 
 	private static final long REF_POSITION = 0;
 
-	private static final Comparator<DfsObjectToPack> OFFSET_SORT = (
+	/**
+	 * Order objects by offset
+	 */
+	protected static final Comparator<DfsObjectToPack> OFFSET_SORT = (
 			DfsObjectToPack a,
 			DfsObjectToPack b) -> Long.signum(a.getOffset() - b.getOffset());
 
@@ -235,6 +242,22 @@ public final class DfsPackFile extends BlockBasedFile {
 	}
 
 	/**
+	 * Get a view of this packfile as a set of objects
+	 * <p>
+	 * To use when the caller only needs to check inclusion (without specific
+	 * order or getting offsets).
+	 *
+	 * @param ctx
+	 *            reader context
+	 * @return a view of this packfile as a set of objects
+	 * @throws IOException
+	 *             cannot load the backing data from storage
+	 */
+	public ObjectIdSet asObjectIdSet(DfsReader ctx) throws IOException {
+		return getPackIndex(ctx);
+	}
+
+	/**
 	 * Get the PackIndex for this PackFile.
 	 *
 	 * @param ctx
@@ -245,10 +268,6 @@ public final class DfsPackFile extends BlockBasedFile {
 	 *             the pack index is not available, or is corrupt.
 	 */
 	public PackIndex getPackIndex(DfsReader ctx) throws IOException {
-		return idx(ctx);
-	}
-
-	private PackIndex idx(DfsReader ctx) throws IOException {
 		if (index != null) {
 			return index;
 		}
@@ -340,8 +359,14 @@ public final class DfsPackFile extends BlockBasedFile {
 			return null;
 		}
 
+		StoredConfig repoConfig = ctx.db.getRepository().getConfig();
+		boolean readChangedPathFilters = repoConfig.getBoolean(
+				ConfigConstants.CONFIG_COMMIT_GRAPH_SECTION,
+				ConfigConstants.CONFIG_KEY_READ_CHANGED_PATHS, false);
+
 		if (commitGraph != null) {
-			return commitGraph;
+			return readChangedPathFilters ? commitGraph
+					: new CommitGraphWithoutCpf(commitGraph);
 		}
 
 		DfsStreamKey commitGraphKey = desc.getStreamKey(COMMIT_GRAPH);
@@ -359,7 +384,8 @@ public final class DfsPackFile extends BlockBasedFile {
 			commitGraph = cg;
 		}
 		ctx.emitIndexLoad(desc, COMMIT_GRAPH, commitGraph);
-		return commitGraph;
+		return readChangedPathFilters ? commitGraph
+				: new CommitGraphWithoutCpf(commitGraph);
 	}
 
 	/**
@@ -377,7 +403,8 @@ public final class DfsPackFile extends BlockBasedFile {
 			return reverseIndex;
 		}
 
-		reverseIndex = indexFactory.getPackIndexes().reverseIndex(ctx, idx(ctx));
+		reverseIndex = indexFactory.getPackIndexes().reverseIndex(ctx,
+				getPackIndex(ctx));
 		if (reverseIndex == null) {
 			throw new IOException(
 					"Couldn't get a reference to the reverse index"); //$NON-NLS-1$
@@ -438,12 +465,12 @@ public final class DfsPackFile extends BlockBasedFile {
 	 *             the pack index is not available, or is corrupt.
 	 */
 	public boolean hasObject(DfsReader ctx, AnyObjectId id) throws IOException {
-		final long offset = idx(ctx).findOffset(id);
+		final long offset = getPackIndex(ctx).findOffset(id);
 		return 0 < offset && !isCorrupt(offset);
 	}
 
 	int findIdxPosition(DfsReader ctx, AnyObjectId id) throws IOException {
-		return idx(ctx).findPosition(id);
+		return getPackIndex(ctx).findPosition(id);
 	}
 
 	/**
@@ -460,12 +487,12 @@ public final class DfsPackFile extends BlockBasedFile {
 	 */
 	ObjectLoader get(DfsReader ctx, AnyObjectId id)
 			throws IOException {
-		long offset = idx(ctx).findOffset(id);
+		long offset = getPackIndex(ctx).findOffset(id);
 		return 0 < offset && !isCorrupt(offset) ? load(ctx, offset) : null;
 	}
 
 	long findOffset(DfsReader ctx, AnyObjectId id) throws IOException {
-		return idx(ctx).findOffset(id);
+		return getPackIndex(ctx).findOffset(id);
 	}
 
 	/**
@@ -491,7 +518,7 @@ public final class DfsPackFile extends BlockBasedFile {
 			if (skipFound && otp.isFound()) {
 				continue;
 			}
-			long p = idx(ctx).findOffset(otp);
+			long p = getPackIndex(ctx).findOffset(otp);
 			if (p <= 0 || isCorrupt(p)) {
 				continue;
 			}
@@ -504,7 +531,7 @@ public final class DfsPackFile extends BlockBasedFile {
 
 	void resolve(DfsReader ctx, Set<ObjectId> matches, AbbreviatedObjectId id,
 			int matchLimit) throws IOException {
-		idx(ctx).resolve(matches, id, matchLimit);
+		getPackIndex(ctx).resolve(matches, id, matchLimit);
 	}
 
 	private byte[] decompress(long position, int sz, DfsReader ctx)
@@ -681,11 +708,11 @@ public final class DfsPackFile extends BlockBasedFile {
 		try {
 			quickCopy = ctx.quickCopy(this, dataOffset, dataLength);
 
-			if (validate && idx(ctx).hasCRC32Support()) {
+			if (validate && getPackIndex(ctx).hasCRC32Support()) {
 				assert(crc1 != null);
 				// Index has the CRC32 code cached, validate the object.
 				//
-				expectedCRC = idx(ctx).findCRC32(src);
+				expectedCRC = getPackIndex(ctx).findCRC32(src);
 				if (quickCopy != null) {
 					quickCopy.crc32(crc1, dataOffset, (int) dataLength);
 				} else {
@@ -978,7 +1005,7 @@ public final class DfsPackFile extends BlockBasedFile {
 
 	private long findDeltaBase(DfsReader ctx, ObjectId baseId)
 			throws IOException, MissingObjectException {
-		long ofs = idx(ctx).findOffset(baseId);
+		long ofs = getPackIndex(ctx).findOffset(baseId);
 		if (ofs < 0) {
 			throw new MissingObjectException(baseId,
 					JGitText.get().missingDeltaBase);
@@ -1072,7 +1099,7 @@ public final class DfsPackFile extends BlockBasedFile {
 	}
 
 	long getObjectSize(DfsReader ctx, AnyObjectId id) throws IOException {
-		final long offset = idx(ctx).findOffset(id);
+		final long offset = getPackIndex(ctx).findOffset(id);
 		return 0 < offset ? getObjectSize(ctx, offset) : -1;
 	}
 
@@ -1198,6 +1225,34 @@ public final class DfsPackFile extends BlockBasedFile {
 		}
 
 		return sizeIdx.getSize(idxPosition);
+	}
+
+	/**
+	 * Return pack(s) with all its objects included in the bitmap.
+	 * <p>
+	 * The bitmap is modified removing the objects in the returned packs.
+	 * <p>
+	 * The list could contain more than one pack in the multipack-index case.
+	 *
+	 * @param ctx
+	 *            a reader
+	 * @param need
+	 *            bitmap with the required objects. It can be modified in this
+	 *            call. The objects from the returned packs are removed from the
+	 *            bitmap.
+	 * @return list of packs with ALL their objects in the bitmap.
+	 * @throws IOException
+	 *             error reading the bitmap index.
+	 */
+	@NonNull
+	List<DfsPackFile> fullyIncludedIn(DfsReader ctx,
+			BitmapIndex.BitmapBuilder need) throws IOException {
+		PackBitmapIndex bi = this.getBitmapIndex(ctx);
+		if (bi != null && need.removeAllOrNone(bi)) {
+			return Collections.singletonList(this);
+		}
+
+		return Collections.emptyList();
 	}
 
 	/**
@@ -1364,16 +1419,12 @@ public final class DfsPackFile extends BlockBasedFile {
 			DfsStreamKey cgkey) throws IOException {
 		ctx.stats.readCommitGraph++;
 		long start = System.nanoTime();
-		StoredConfig repoConfig = ctx.db.getRepository().getConfig();
-		boolean readChangedPathFilters = repoConfig.getBoolean(
-				ConfigConstants.CONFIG_COMMIT_GRAPH_SECTION,
-				ConfigConstants.CONFIG_KEY_READ_CHANGED_PATHS, false);
 		try (ReadableChannel rc = ctx.db.openFile(desc, COMMIT_GRAPH)) {
 			long size;
 			CommitGraph cg;
 			try {
 				cg = CommitGraphLoader.read(alignTo8kBlocks(rc),
-						readChangedPathFilters);
+						true);
 			} finally {
 				size = rc.position();
 				ctx.stats.readCommitGraphBytes += size;
@@ -1495,7 +1546,8 @@ public final class DfsPackFile extends BlockBasedFile {
 				PackBitmapIndex bmidx;
 				try {
 					bmidx = PackBitmapIndex.read(alignTo8kBlocks(rc),
-							() -> pack.idx(ctx), () -> pack.getReverseIdx(ctx),
+							() -> pack.getPackIndex(ctx),
+							() -> pack.getReverseIdx(ctx),
 							ctx.getOptions().shouldLoadRevIndexInParallel());
 				} finally {
 					size = rc.position();
@@ -1649,6 +1701,41 @@ public final class DfsPackFile extends BlockBasedFile {
 		RefWithSize(V ref, long size) {
 			this.ref = ref;
 			this.size = size;
+		}
+	}
+
+	/**
+	 * Decorator to hide the ChangedPathFilters from the underlying commit graph
+	 *
+	 * @param delegate
+	 *            the commit graph
+	 */
+	private record CommitGraphWithoutCpf(CommitGraph delegate)
+			implements CommitGraph {
+
+		@Override
+		public int findGraphPosition(AnyObjectId commit) {
+			return delegate.findGraphPosition(commit);
+		}
+
+		@Override
+		public CommitData getCommitData(int graphPos) {
+			return delegate.getCommitData(graphPos);
+		}
+
+		@Override
+		public ObjectId getObjectId(int graphPos) {
+			return delegate.getObjectId(graphPos);
+		}
+
+		@Override
+		public ChangedPathFilter getChangedPathFilter(int graphPos) {
+			return null;
+		}
+
+		@Override
+		public long getCommitCnt() {
+			return delegate.getCommitCnt();
 		}
 	}
 }

@@ -27,7 +27,7 @@ import org.eclipse.jgit.lib.Repository;
 /**
  * The representation of a repo sub project.
  *
- * @see <a href="https://code.google.com/p/git-repo/">git-repo project page</a>
+ * @see <a href="https://gerrit.googlesource.com/git-repo/">git-repo project page</a>
  * @since 4.0
  */
 public class RepoProject implements Comparable<RepoProject> {
@@ -41,6 +41,7 @@ public class RepoProject implements Comparable<RepoProject> {
 	private String upstream;
 	private String destBranch;
 	private String recommendShallow;
+	private String review;
 	private String url;
 	private String defaultRevision;
 
@@ -331,6 +332,27 @@ public class RepoProject implements Comparable<RepoProject> {
 	public void setRecommendShallow(String recommendShallow) {
 		this.recommendShallow = recommendShallow;
 	}
+
+	/**
+	 * Return the Gerrit review server URL defined by the project's remote.
+	 *
+	 * @return the review server URL
+	 * @since 7.8
+	 */
+	public String getReview() {
+		return review;
+	}
+
+	/**
+	 * Sets the Gerrit review server URL.
+	 *
+	 * @param review the review server URL
+	 * @since 7.8
+	 */
+	public void setReview(String review) {
+		this.review = review;
+	}
+
 
 	/**
 	 * Add a copy file configuration.

@@ -10,18 +10,19 @@
 
 package org.eclipse.jgit.treewalk.filter;
 
-import org.eclipse.jgit.internal.JGitText;
-import org.eclipse.jgit.internal.storage.commitgraph.ChangedPathFilter;
-import org.eclipse.jgit.lib.Constants;
-import org.eclipse.jgit.revwalk.RevCommit;
-import org.eclipse.jgit.revwalk.RevWalk;
-import org.eclipse.jgit.treewalk.TreeWalk;
-import org.eclipse.jgit.util.StringUtils;
-
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
+
+import org.eclipse.jgit.internal.JGitText;
+import org.eclipse.jgit.internal.storage.commitgraph.ChangedPathFilter;
+import org.eclipse.jgit.lib.Constants;
+import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.jgit.revwalk.RevFlag;
+import org.eclipse.jgit.revwalk.RevWalk;
+import org.eclipse.jgit.treewalk.TreeWalk;
+import org.eclipse.jgit.util.StringUtils;
 
 /**
  * Filter tree entries that modified the contents of particular file paths.
@@ -63,33 +64,19 @@ public class ChangedPathTreeFilter extends TreeFilter {
 	}
 
 	private ChangedPathTreeFilter(String... paths) {
-		List<String> filtered = Arrays.stream(paths)
-				.map(s -> StringUtils.trim(s, '/'))
-				.collect(Collectors.toList());
-
-		if (filtered.size() == 0)
-			throw new IllegalArgumentException(
-					JGitText.get().atLeastOnePathIsRequired);
-
-		if (filtered.stream().anyMatch(s -> s.isEmpty() || s.isBlank())) {
-			throw new IllegalArgumentException(
-					JGitText.get().emptyPathNotPermitted);
-		}
-
-		this.paths = filtered;
-		this.rawPaths = this.paths.stream().map(Constants::encode)
-				.collect(Collectors.toList());
-		if (filtered.size() == 1) {
-			this.pathFilter = PathFilter.create(paths[0]);
-		} else {
-			this.pathFilter = OrTreeFilter.create(Arrays.stream(paths)
-					.map(PathFilter::create).collect(Collectors.toList()));
-		}
+		setPaths(paths);
 	}
 
 	@Override
 	public boolean shouldTreeWalk(RevCommit c, RevWalk rw,
 			MutableBoolean cpfUsed) {
+		// don't apply cpf to root commits
+		// other logic might have overwritten the parentList
+		// to shortcut the walk.
+		if (c.getParentCount() == 0) {
+			return true;
+		}
+
 		ChangedPathFilter cpf = c.getChangedPathFilter(rw);
 		if (cpf == null) {
 			return true;
@@ -98,7 +85,21 @@ public class ChangedPathTreeFilter extends TreeFilter {
 			cpfUsed.orValue(true);
 		}
 		// return true if at least one path might exist in cpf
-		return rawPaths.stream().anyMatch(cpf::maybeContains);
+		if (rawPaths.stream().anyMatch(cpf::maybeContains)) {
+			return true;
+		}
+
+		if (c.getParentCount() == 1) {
+			return false;
+		}
+
+		// only for merge commits
+		RevCommit baseParent = c.getParent(0);
+		if (baseParent.has(RevFlag.UNINTERESTING)) {
+			// merge commit CPF can only redirect to the base parent
+			return true;
+		}
+		return false;
 	}
 
 	@Override
@@ -123,6 +124,38 @@ public class ChangedPathTreeFilter extends TreeFilter {
 	 */
 	public List<String> getPaths() {
 		return paths;
+	}
+
+	/**
+	 * Reset the paths this filter matches to a new array of paths.
+	 *
+	 * @param paths
+	 *            new paths that this filter matches with.
+	 * @since 7.8
+	 */
+	public void setPaths(String... paths) {
+		List<String> filtered = Arrays.stream(paths)
+				.map(s -> StringUtils.trim(s, '/'))
+				.collect(Collectors.toList());
+
+		if (filtered.size() == 0)
+			throw new IllegalArgumentException(
+					JGitText.get().atLeastOnePathIsRequired);
+
+		if (filtered.stream().anyMatch(s -> s.isEmpty() || s.isBlank())) {
+			throw new IllegalArgumentException(
+					JGitText.get().emptyPathNotPermitted);
+		}
+
+		this.paths = filtered;
+		this.rawPaths = this.paths.stream().map(Constants::encode)
+				.collect(Collectors.toList());
+		if (filtered.size() == 1) {
+			this.pathFilter = PathFilter.create(paths[0]);
+		} else {
+			this.pathFilter = OrTreeFilter.create(Arrays.stream(paths)
+					.map(PathFilter::create).collect(Collectors.toList()));
+		}
 	}
 
 	@SuppressWarnings("nls")

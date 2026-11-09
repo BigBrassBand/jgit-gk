@@ -1,14 +1,46 @@
-# Java Git
+# Eclipse JGit
 
 An implementation of the Git version control system in pure Java.
 
-This project is licensed under the __EDL__ (Eclipse Distribution
-License).
+### License
+
+[![License](https://img.shields.io/badge/License-BSD_3--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
+<br/>
+JGit is licensed under the Eclipse Distribution License 1.0 (BSD-3-Clause).
+
+
+### Latest Release
+
+[![Maven Central](https://img.shields.io/maven-central/v/org.eclipse.jgit/org.eclipse.jgit.svg?label=Maven%20Central)](https://search.maven.org/artifact/org.eclipse.jgit/org.eclipse.jgit)
+[![javadoc](https://javadoc.io/badge2/org.eclipse.jgit/org.eclipse.jgit/javadoc.svg)](https://javadoc.io/doc/org.eclipse.jgit/org.eclipse.jgit)
+[![Java](https://img.shields.io/badge/Java-17-blue.svg)](https://adoptium.net/temurin/releases?version=17&os=any&arch=any)
+
+### Support
+
+[![Issues](https://img.shields.io/github/issues-raw/eclipse-jgit/jgit.svg?maxAge=25000)](https://github.com/eclipse-jgit/jgit/issues)
+[![Discussions](https://img.shields.io/github/discussions/eclipse-jgit/jgit.svg?maxAge=25000)](https://github.com/eclipse-jgit/jgit/discussions)
+<br/>
+Post questions, comments or discussions to the jgit-dev@eclipse.org mailing list.
+You need to be [subscribed](https://dev.eclipse.org/mailman/listinfo/jgit-dev)
+to post.
+
+### Contributing
+
+[![Contributors](https://img.shields.io/github/contributors/eclipse-jgit/jgit.svg?style=flat)]()
+[![Last commit](https://img.shields.io/github/last-commit/eclipse-jgit/jgit.svg?style=flat)]()
+[![Commit activity the past week, 4 weeks](https://img.shields.io/github/commit-activity/y/eclipse-jgit/jgit.svg?style=flat)]()
+[![Commits since](https://img.shields.io/github/commits-since/eclipse-jgit/jgit/v7.4.0.202509020913-r.svg)]()
+<br/>
+See the [JGit and EGit Contributor Guide](http://wiki.eclipse.org/EGit/Contributor_Guide).
+
+### Build
 
 JGit can be imported straight into Eclipse and built and tested from
 there. It can be built from the command line using
 [Maven](https://maven.apache.org/) or [Bazel](https://bazel.build/).
 The CI builds use Maven and run on [Jenkins](https://ci.eclipse.org/jgit/).
+
+## Modules
 
 - __org.eclipse.jgit__
 
@@ -78,6 +110,15 @@ __org.eclipse.jgit.junit.ssh__: Helpers for unit testing
 - __org.eclipse.jgit.pgm.test__: Unit tests for org.eclipse.jgit.pgm
 - __org.eclipse.jgit.ssh.apache.test__: Unit tests for org.eclipse.jgit.ssh.apache
 - __org.eclipse.jgit.test__: Unit tests for org.eclipse.jgit
+
+## SBOM
+
+To enhance supply chain security and offer users clear insight into project components,
+Eclipse JGit now generates a Software Bill of Materials (SBOM) for every release.
+These are published to the Eclipse Foundation SBOM registry
+[Eclipse Foundation SBOM registry](https://sbom.eclipse.org/projects/e315d88f-0474-4a00-a6ed-0b95e62a2acc/collectionprojects),
+with access instructions and usage details available in
+this [documentation](https://eclipse-csi.github.io/security-handbook/sbom/registry.html).
 
 ## Warnings/Caveats
 
@@ -160,17 +201,6 @@ There are some missing features:
 - git protocol V2 (client side): packfile-uris
 - multi-pack index
 - split index
-
-## Support
-
-Post questions, comments or discussions to the jgit-dev@eclipse.org mailing list.
-You need to be [subscribed](https://dev.eclipse.org/mailman/listinfo/jgit-dev)
-to post. File bugs and enhancement requests in
-[Bugzilla](https://wiki.eclipse.org/EGit/Contributor_Guide#Filing_Bugs).
-
-## Contributing
-
-See the [EGit Contributor Guide](http://wiki.eclipse.org/EGit/Contributor_Guide).
 
 ## About Git
 

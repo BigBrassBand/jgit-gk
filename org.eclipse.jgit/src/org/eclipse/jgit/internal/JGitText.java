@@ -98,6 +98,7 @@ public class JGitText extends TranslationBundle {
 	/***/ public String bitmapsMustBePrepared;
 	/***/ public String bitmapUseNoopNoListener;
 	/***/ public String blameNotCommittedYet;
+	/***/ public String blameRegionCoverAllLines;
 	/***/ public String blockLimitNotMultipleOfBlockSize;
 	/***/ public String blockLimitNotPositive;
 	/***/ public String blockSizeNotPowerOf2;
@@ -146,6 +147,7 @@ public class JGitText extends TranslationBundle {
 	/***/ public String cannotMoveIndexTo;
 	/***/ public String cannotMovePackTo;
 	/***/ public String cannotOpenService;
+    /***/ public String cannotOpenMidx;
 	/***/ public String cannotParseDate;
 	/***/ public String cannotParseGitURIish;
 	/***/ public String cannotPullOnARepoWithState;
@@ -289,6 +291,7 @@ public class JGitText extends TranslationBundle {
 	/***/ public String deepenSinceWithDeepen;
 	/***/ public String deleteBranchUnexpectedResult;
 	/***/ public String deleteFileFailed;
+	/***/ public String deleteLooseRef;
 	/***/ public String deletedOrphanInPackDir;
 	/***/ public String deleteRequiresZeroNewId;
 	/***/ public String deleteTagUnexpectedResult;
@@ -409,6 +412,7 @@ public class JGitText extends TranslationBundle {
 	/***/ public String hunkBelongsToAnotherFile;
 	/***/ public String hunkDisconnectedFromFile;
 	/***/ public String hunkHeaderDoesNotMatchBodyLineCountOf;
+	/***/ public String ignoringFunnyRefLocally;
 	/***/ public String illegalArgumentNotA;
 	/***/ public String illegalCombinationOfArguments;
 	/***/ public String illegalHookName;
@@ -542,6 +546,7 @@ public class JGitText extends TranslationBundle {
 	/***/ public String messageAndTaggerNotAllowedInUnannotatedTags;
 	/***/ public String midxChunkNeeded;
 	/***/ public String midxChunkRepeated;
+    /***/ public String midxChunkTooBig;
 	/***/ public String midxChunkUnknown;
 	/***/ public String minutesAgo;
 	/***/ public String mismatchOffset;
@@ -669,6 +674,7 @@ public class JGitText extends TranslationBundle {
 	/***/ public String pushCertificateInvalidFieldValue;
 	/***/ public String pushCertificateInvalidHeader;
 	/***/ public String pushCertificateInvalidSignature;
+	/***/ public String pushCertificateInconsistentPushOptions;
 	/***/ public String pushDefaultNothing;
 	/***/ public String pushDefaultNoUpstream;
 	/***/ public String pushDefaultSimple;
@@ -816,6 +822,7 @@ public class JGitText extends TranslationBundle {
 	/***/ public String tagAlreadyExists;
 	/***/ public String tagNameInvalid;
 	/***/ public String tagOnRepoWithoutHEADCurrentlyNotSupported;
+	/***/ public String temporaryBufferIsDestroyed;
 	/***/ public String timeoutMeasureFsTimestampResolution;
 	/***/ public String transactionAborted;
 	/***/ public String theFactoryMustNotBeNull;

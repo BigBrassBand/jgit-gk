@@ -17,7 +17,7 @@
   <parent>
     <groupId>org.eclipse.jgit</groupId>
     <artifactId>org.eclipse.jgit-parent</artifactId>
-    <version>7.4.0.202509020913-r-cloud.6</version>
+    <version>7.8.1.202611041320-r</version>
   </parent>
 
   <artifactId>org.eclipse.jgit.pgm</artifactId>
@@ -107,8 +107,8 @@
     </dependency>
 
     <dependency>
-      <groupId>org.eclipse.jetty.ee10</groupId>
-      <artifactId>jetty-ee10-servlet</artifactId>
+      <groupId>org.eclipse.jetty.ee11</groupId>
+      <artifactId>jetty-ee11-servlet</artifactId>
     </dependency>
 
     <dependency>

@@ -110,29 +110,28 @@ class StartGenerator extends Generator {
 
 		walker.queue = q;
 
-		if (walker instanceof DepthWalk) {
-			DepthWalk dw = (DepthWalk) walker;
-			g = new DepthGenerator(dw, pending);
-		} else {
-			g = new PendingGenerator(w, pending, rf, pendingOutputType);
-
-			if (walker.hasRevSort(RevSort.BOUNDARY)) {
-				// Because the boundary generator may produce uninteresting
-				// commits we cannot allow the pending generator to dispose
-				// of them early.
-				//
-				((PendingGenerator) g).canDispose = false;
-			}
-		}
-
-		if ((g.outputType() & NEEDS_REWRITE) != 0) {
-			g = new RewriteGenerator(g);
-		}
-
 		if (walker.hasRevSort(RevSort.TOPO)
 				&& walker.hasRevSort(RevSort.TOPO_KEEP_BRANCH_TOGETHER)) {
 			throw new IllegalStateException(JGitText
 					.get().cannotCombineTopoSortWithTopoKeepBranchTogetherSort);
+		}
+
+		if (walker instanceof DepthWalk) {
+			DepthWalk dw = (DepthWalk) walker;
+			g = new DepthGenerator(dw, pending);
+		} else {
+			// Because the boundary generator may produce uninteresting
+			// commits we cannot allow the pending generator to dispose
+			// of them early.
+			//
+			boolean canDispose = !walker.hasRevSort(RevSort.BOUNDARY);
+
+			g = new PendingGenerator(w, pending, rf, pendingOutputType,
+					canDispose);
+		}
+
+		if ((g.outputType() & NEEDS_REWRITE) != 0) {
+			g = new RewriteGenerator(g);
 		}
 
 		if (walker.hasRevSort(RevSort.TOPO)

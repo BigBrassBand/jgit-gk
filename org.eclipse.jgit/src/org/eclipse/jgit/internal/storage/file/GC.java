@@ -82,6 +82,8 @@ import org.eclipse.jgit.lib.ConfigConstants;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.CoreConfig;
 import org.eclipse.jgit.lib.FileMode;
+import org.eclipse.jgit.lib.GcConfig;
+import org.eclipse.jgit.lib.GcConfig.PackRefsMode;
 import org.eclipse.jgit.lib.NullProgressMonitor;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectIdSet;
@@ -171,6 +173,8 @@ public class GC {
 
 	private PackConfig pconfig;
 
+	private GcConfig gcConfig;
+
 	/**
 	 * the refs which existed during the last call to {@link #repack()}. This is
 	 * needed during {@link #prune(Set)} where we can optimize by looking at the
@@ -184,7 +188,7 @@ public class GC {
 	 * prune() to inspect only those reflog entries which have been added since
 	 * last repack().
 	 */
-	private Instant lastRepackTime;
+	private Instant lastRepackTime = Instant.EPOCH;
 
 	/**
 	 * Whether gc should do automatic housekeeping
@@ -207,6 +211,7 @@ public class GC {
 		this.repo = repo;
 		this.pconfig = new PackConfig(repo);
 		this.pm = NullProgressMonitor.INSTANCE;
+		this.gcConfig = repo.getConfig().get(GcConfig.KEY);
 	}
 
 	/**
@@ -282,6 +287,18 @@ public class GC {
 		return (executor != null) ? executor : WorkQueue.getExecutor();
 	}
 
+	/**
+	 * Set the gc configuration.
+	 *
+	 * @param gcConfig
+	 *            the gc configuration
+	 * @return this instance
+	 */
+	public GC setGcConfig(GcConfig gcConfig) {
+		this.gcConfig = gcConfig;
+		return this;
+	}
+
 	private Collection<Pack> doGc()
 			throws IOException, ParseException, GitAPIException {
 		if (automatic && !needGc()) {
@@ -292,8 +309,13 @@ public class GC {
 				return Collections.emptyList();
 			}
 			pm.start(6 /* tasks */);
-			new PackRefsCommand(repo).setProgressMonitor(pm).setAll(true)
-					.call();
+			boolean packRefs = gcConfig.getPackRefs() == PackRefsMode.TRUE
+					|| (gcConfig.getPackRefs() == PackRefsMode.NOTBARE
+							&& !repo.isBare());
+			if (packRefs) {
+				new PackRefsCommand(repo).setProgressMonitor(pm).setAll(true)
+						.call();
+			}
 			// TODO: implement reflog_expire(pm, repo);
 			Collection<Pack> newPacks = repack();
 			prune(Collections.emptySet());
@@ -744,6 +766,15 @@ public class GC {
 			packExpireDate = System.currentTimeMillis() - packExpireAgeMillis;
 		}
 		return packExpireDate;
+	}
+
+	/**
+	 * Get the gc configuration.
+	 *
+	 * @return the gc configuration.
+	 */
+	public GcConfig getGcConfig() {
+		return gcConfig;
 	}
 
 	/**
@@ -1662,7 +1693,7 @@ public class GC {
 	 */
 	public void setPackExpireAgeMillis(long packExpireAgeMillis) {
 		this.packExpireAgeMillis = packExpireAgeMillis;
-		expire = null;
+		packExpire = null;
 	}
 
 	/**
@@ -1964,6 +1995,9 @@ public class GC {
 		}
 
 		private long getPID() {
+			if (SystemReader.getInstance().isAndroid()) {
+				return 0;
+			}
 			return ProcessHandle.current().pid();
 		}
 
