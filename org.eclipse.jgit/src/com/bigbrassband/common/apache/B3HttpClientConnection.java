@@ -182,10 +182,6 @@ public class B3HttpClientConnection implements HttpConnection {
 	 */
 	public static final int MAX_NON_OK_BODY_BYTES = 1024 * 1024;
 
-	//the socket timeout bounds one read, not the whole body: read() returns as soon as any byte
-	//arrives, so a server sending one at a time is bounded only by the byte limit
-	private static final int READ_BUDGET_READ_TIMEOUTS = 5;
-
 	private static final Cleaner CLEANER = Cleaner.create();
 	private static final AtomicLong initCount = new AtomicLong(0);
 	private static final AtomicLong closeCount = new AtomicLong(0);
@@ -381,14 +377,18 @@ public class B3HttpClientConnection implements HttpConnection {
 		return client;
 	}
 
-	//zero means the body is not read. A read timeout of zero reaches setSocketTimeout as "wait
+	//one read timeout for the whole body: the socket timeout bounds a single read, not the body,
+	//since read() returns as soon as any byte arrives. Not a multiple of it: jgit sets the read
+	//timeout from the transport timeout, minutes long where the appserver configures it, and an
+	//error body nobody may ask for must not hold an indexing thread for several of those.
+	//Zero means the body is not read. A read timeout of zero reaches setSocketTimeout as "wait
 	//forever", and jgit passes exactly that when the repository configures no timeout (RemoteConfig
 	//reads KEY_TIMEOUT with a default of 0), so a single read need never return
 	private long readBudgetMillis() {
 		if (readTimeoutMilliseconds == null || readTimeoutMilliseconds <= 0) {
 			return 0L;
 		}
-		return (long) readTimeoutMilliseconds * READ_BUDGET_READ_TIMEOUTS;
+		return readTimeoutMilliseconds;
 	}
 
 	private SSLContext getSSLContext() {
@@ -1021,7 +1021,7 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * <p>
 	 * The read is bounded twice, because it waits on a body nobody may ever ask for: by
 	 * {@link #MAX_NON_OK_BODY_BYTES}, counted as the bytes came off the wire, and by a time budget
-	 * of five read timeouts. A body that hits either is cut short: the response is closed, which
+	 * of one read timeout. A body that hits either is cut short: the response is closed, which
 	 * releases the socket without reading the remainder, and {@code CutShortBody} hands on the
 	 * prefix that was kept followed by a {@link CutShortBodyException} saying why. A body that
 	 * breaks in mid-flight ends the same way. Without a finite read timeout nothing bounds a single
@@ -1144,9 +1144,9 @@ public class B3HttpClientConnection implements HttpConnection {
 		//null when the body ended within the bound, head then holding all of it; otherwise why the
 		//read stopped, head holding at most MAX_NON_OK_BODY_BYTES + 1 bytes.
 		//The deadline is only tested between reads, so the last read can still take a whole socket
-		//timeout past it. That slack is why the budget is counted in read timeouts rather than set
-		//as one: bounding the read itself would mean handing setSocketTimeout a shrinking value,
-		//and zero there means "wait forever", not "give up now".
+		//timeout past it, and the worst case is two read timeouts. Bounding that read too would
+		//mean handing setSocketTimeout a shrinking value, and zero there means "wait forever", not
+		//"give up now".
 		private static CutShortBodyException.Reason read(InputStream in, ByteArrayOutputStream head,
 				long deadlineNanos) throws IOException {
 			byte[] chunk = new byte[8192];
