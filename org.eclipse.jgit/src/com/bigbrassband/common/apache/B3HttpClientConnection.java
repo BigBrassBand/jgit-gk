@@ -836,9 +836,8 @@ public class B3HttpClientConnection implements HttpConnection {
 	//On TLS 1.3, SSLSocket.close() reads once more for the peer's close_notify when no input is
 	//buffered, which is the state a body read to its end leaves behind; that read runs under the
 	//socket timeout, and only when the timeout is positive (SSLSocketInputRecord.deplete). A
-	//server is free never to answer, so the timeout is set to 1 ms, which caps that read. Not 0:
-	//it would skip the read too, but it means "no timeout" to every other read on the socket, and
-	//one may still be in flight — Deadline closes the socket under a reader blocked in it.
+	//server is free never to answer, so the timeout is set to 1 ms, which caps that read; 0 would
+	//skip it altogether and serve as well.
 	//On the socket, not the connection: a connection may already be released by the time a caller
 	//gets here, and a pooled one then refuses every call. A socket is never reused, and every
 	//release closes it, so one found closed is left alone
@@ -1317,8 +1316,12 @@ public class B3HttpClientConnection implements HttpConnection {
 						}
 						throw e;
 					}
+					//an SSLSocket closed by the deadline between two reads answers the next one with -1
+					//rather than a throw, and a body framed by the connection's end passes that on as
+					//its own end
 					if (n < 0) {
-						return null;
+						return (deadline != null && deadline.fired()) ? CutShortBodyException.Reason.TIME_BUDGET
+								: null;
 					}
 					head.write(chunk, 0, n);
 					read += n;
