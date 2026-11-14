@@ -74,11 +74,14 @@ import org.apache.http.conn.socket.PlainConnectionSocketFactory;
 import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
 import org.apache.http.conn.ssl.X509HostnameVerifier;
 import org.apache.http.entity.AbstractHttpEntity;
+import org.apache.http.entity.ByteArrayEntity;
+import org.apache.http.entity.ContentType;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.impl.client.HttpClients;
 import org.apache.http.impl.conn.BasicHttpClientConnectionManager;
 import org.apache.http.protocol.HttpContext;
+import org.apache.http.util.EntityUtils;
 import org.eclipse.jgit.annotations.NonNull;
 import org.eclipse.jgit.transport.http.HttpConnection;
 import org.eclipse.jgit.util.TemporaryBuffer;
@@ -91,6 +94,7 @@ import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLSession;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManager;
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.FilterInputStream;
 import java.io.IOException;
@@ -107,6 +111,7 @@ import java.net.MalformedURLException;
 import java.net.ProtocolException;
 import java.net.Proxy;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.security.KeyManagementException;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
@@ -132,11 +137,12 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_PUT;
  * <li>{@code Exchange} holds the state of one exchange and renders the single verdict the
  * counters are told about. It deliberately reaches neither the connection nor the body stream,
  * which is what lets a cleaner hold it.
- * <li>{@code NonOkBodyCloser} is a response interceptor that closes the connection of every
- * response other than 200, before the caller sees it. Nothing reads such a body, so nothing is
- * read off the wire first — the socket comes back at once.
- * <li>{@code DiscardedBody} is the replacement entity it installs, so that a caller which does
- * ask for one of those bodies is told it is gone rather than handed an empty one.
+ * <li>{@code NonOkBodyBuffer} is a response interceptor that reads the body of every response
+ * other than 200 to its end and releases the connection, before the caller sees it. The caller
+ * gets an in-memory copy, and {@link #getResponseMessage()} puts a {@code text/plain} one after
+ * the reason phrase — the only part of a refusal jgit's {@code TransportHttp} keeps.
+ * <li>{@code DiscardedBody} is the entity it installs when that read fails, so that a caller
+ * which asks for the body is told it is gone rather than handed an empty one.
  * <li>{@code TrackedBodyStream} wraps a body handed to the caller and tells the exchange when
  * that body reaches its end or is closed.
  * <li>{@code ClosingConnectionManager} wraps the connection manager and closes every connection
@@ -147,8 +153,8 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_PUT;
  * the connection object as soon as it holds the body stream, so on every fetch this object
  * becomes unreachable while its body is still being read. A single cleanup action on the
  * connection would therefore count each real pack fetch as abandoned. Instead the exchange is
- * settled by whichever comes first: the exec chain returning, for a response already closed
- * unread; the body stream reaching its end or being closed; or collection — of the connection,
+ * settled by whichever comes first: the exec chain returning, for a response already
+ * released; the body stream reaching its end or being closed; or collection — of the connection,
  * or of the stream, two cleaners with the connection's deferring to the stream's while a body is
  * out. The connection also holds the stream it handed out, so the stream's collection cannot
  * precede the connection's — it coincides with it or follows it. A compare-and-set inside
@@ -231,7 +237,7 @@ public class B3HttpClientConnection implements HttpConnection {
 	/**
 	 * @return number of exchanges whose connection came back, since last call (resets counter).
 	 *         Every way of getting there lands here and none is told apart — a body read to its
-	 *         end, a body closed before it, a response other than 200 closed unread, a response
+	 *         end, a body closed before it, a response other than 200 buffered or failing to be, a response
 	 *         with no streaming body to begin with, and a chain that threw over a body still on
 	 *         the socket.
 	 */
@@ -278,7 +284,8 @@ public class B3HttpClientConnection implements HttpConnection {
 	 *         all, since last call (resets counter).
 	 *         <p>
 	 *         On the httpclient this builds against, only a 200 reaches here: every other status
-	 *         has its connection closed before the caller sees the response, because {@code
+	 *         has its body read and its connection released before the caller sees the response,
+	 *         because {@code
 	 *         ProtocolExec} always hands the interceptor an {@code HttpResponseProxy} and that is
 	 *         {@link Closeable}. A response that is not would take the one branch that closes
 	 *         nothing, and could be counted here whatever its status.
@@ -313,7 +320,7 @@ public class B3HttpClientConnection implements HttpConnection {
 			HttpClientBuilder clientBuilder = HttpClients.custom();
 			//first, so the entity it replaces is the one that came off the wire rather than the
 			//decompressing wrapper ResponseContentEncoding puts around it
-			clientBuilder.addInterceptorFirst(new NonOkBodyCloser(exchange));
+			clientBuilder.addInterceptorFirst(new NonOkBodyBuffer(exchange));
 			HttpClientConnectionManager connectionManager = null;
 			if(httpClientConnectionManagerFactory!=null)
 				connectionManager = httpClientConnectionManagerFactory.getConnectionManager();
@@ -453,10 +460,46 @@ public class B3HttpClientConnection implements HttpConnection {
 		return url;
 	}
 
+	/**
+	 * The reason phrase, followed by the body of a response other than 200 when that body is
+	 * {@code text/plain}. jgit's {@code TransportHttp} builds its exception text from this rather
+	 * than from the body, so this is how a provider's explanation of a refusal reaches a caller —
+	 * Azure DevOps Services, for one, says only "Bad Request" in the status line and names the
+	 * unsupported filter in the body.
+	 */
 	@Override
 	public String getResponseMessage() throws IOException {
 		execute();
-		return resp.getStatusLine().getReasonPhrase();
+		String reason = resp.getStatusLine().getReasonPhrase();
+		String bodyText = nonOkBodyText();
+		if (bodyText.isEmpty()) {
+			return reason;
+		}
+		return (reason == null || reason.isEmpty()) ? bodyText : reason + ": " + bodyText; //$NON-NLS-1$
+	}
+
+	//text/plain only: that is the form git servers give a refusal in, while an HTML sign-in page or
+	//an error page would put a whole document of markup into every log line carrying the message
+	private String nonOkBodyText() {
+		HttpEntity body = resp.getEntity();
+		//a non-streaming entity is the in-memory copy NonOkBodyBuffer installed; a 200 body is still
+		//on its socket and belongs to whoever takes the stream
+		if (resp.getStatusLine().getStatusCode() == HttpStatus.SC_OK || body == null
+				|| body.isStreaming()) {
+			return ""; //$NON-NLS-1$
+		}
+		ContentType type = ContentType.getLenient(body);
+		if (type == null || !ContentType.TEXT_PLAIN.getMimeType().equalsIgnoreCase(type.getMimeType())) {
+			return ""; //$NON-NLS-1$
+		}
+		try {
+			//the declared charset when there is one and it is known; UTF-8 otherwise
+			return EntityUtils.toString(body, StandardCharsets.UTF_8).trim();
+		} catch (IOException e) {
+			//a copy that failed to decompress, or a body that could not be read at all: the status
+			//line is then all there is to say
+			return ""; //$NON-NLS-1$
+		}
 	}
 
 	private void execute() throws IOException, ClientProtocolException {
@@ -857,7 +900,7 @@ public class B3HttpClientConnection implements HttpConnection {
 		}
 
 		//the exec chain has returned, so no further hop can revise the verdict; a response already
-		//closed unread is counted here rather than waiting to be collected
+		//released is counted here rather than waiting to be collected
 		void exchangeSettled() {
 			if (state.get() == State.RELEASED) {
 				account();
@@ -933,26 +976,24 @@ public class B3HttpClientConnection implements HttpConnection {
 	}
 
 	/**
-	 * Closes the connection of any response other than 200, before the caller sees it.
+	 * Reads the body of any response other than 200 to its end and releases the connection, before
+	 * the caller sees it; the caller gets an in-memory copy in its place.
 	 * <p>
-	 * Nothing on the transport path reads such a body. jgit's {@code TransportHttp} throws on the
-	 * status line — from {@code openResponse} on every service call, and from each {@code case} of
-	 * {@code connect} that is not {@code HTTP_OK} — and builds its message out of the status line
-	 * rather than the body. So there is nothing there to preserve, and reading the body off the
-	 * wire first would only make the caller wait for bytes on their way to being discarded.
+	 * jgit's {@code TransportHttp} throws on the status line — from {@code openResponse} on every
+	 * service call, and from each {@code case} of {@code connect} that is not {@code HTTP_OK} — and
+	 * builds its message from {@link #getResponseMessage()}, never from the body. A provider that
+	 * explains a refusal does so in the body, so the body has to be read here, while the socket is
+	 * still ours, for {@code getResponseMessage()} to pass it on. The price is waiting for that body
+	 * to arrive before the socket comes back, where closing it unread would not wait.
 	 * <p>
-	 * That rule is the transport's, not the whole fork's: {@code org.eclipse.jgit.lfs.SmudgeFilter}
-	 * accepts 203 alongside 200 and parses that body as JSON, and it takes its connection from the
-	 * same process-wide {@code HttpTransport} connection factory. Under this
-	 * interceptor such a response arrives discarded. The LFS module is out of scope deliberately
-	 * rather than by oversight: 203 is the status of the sign-in page this class exists to stop
-	 * leaking, so admitting it would give up the fix. Anything wiring this factory and LFS together
-	 * needs a different answer than this one.
+	 * The copy is kept whatever its content type, so that any caller which asks for it gets the
+	 * real body: {@code org.eclipse.jgit.lfs.SmudgeFilter} accepts 203 alongside 200 and parses that
+	 * body as JSON, taking its connection from the same process-wide {@code HttpTransport} connection
+	 * factory. Which part of it goes into the message is {@code getResponseMessage()}'s decision.
 	 * <p>
 	 * The fork's other consumer cannot reach this code at all: GIJ Data Center installs a
 	 * same-named factory from {@code org.eclipse.jgit.transport.http.apache}, not this package, and
-	 * pins the {@code -r-gk} line, where this package does not exist. Both are checkable from this
-	 * repository; whether DC also uses LFS is not, and does not matter while that holds.
+	 * pins the {@code -r-gk} line, where this package does not exist.
 	 * <p>
 	 * A 200 is left alone entirely: that body is the one the caller asked for, and the caller's
 	 * own reading is what releases its socket.
@@ -963,17 +1004,17 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * rather than an empty {@code ContentLengthInputStream}, and {@code BasicHttpEntity.isStreaming}
 	 * singles that instance out as not streaming. So {@code ResponseEntityProxy.enchance} never
 	 * wraps it, no connection holder is attached, and the exec chain has already released the
-	 * socket. The caller then gets the real body — empty and whole, with nothing here to discard.
+	 * socket. The caller then gets the real body — empty and whole, with nothing here to copy.
 	 * <p>
 	 * Runs once per hop, so a redirect chain resolved inside httpclient reaches it for every
-	 * response in the chain: the 3xx hops are closed here, the final 200 is not. That is the same
+	 * response in the chain: the 3xx hops are read here, the final 200 is not. That is the same
 	 * socket-per-hop count as without this interceptor, since httpclient leases again for each hop
 	 * and ClosingConnectionManager closes every socket as it is released.
 	 */
-	private static final class NonOkBodyCloser implements HttpResponseInterceptor {
+	private static final class NonOkBodyBuffer implements HttpResponseInterceptor {
 		private final Exchange exchange;
 
-		NonOkBodyCloser(Exchange exchange) {
+		NonOkBodyBuffer(Exchange exchange) {
 			this.exchange = exchange;
 		}
 
@@ -990,31 +1031,43 @@ public class B3HttpClientConnection implements HttpConnection {
 				exchange.bodyReleased(closeable);
 				return;
 			}
-			//the exact code, not a 2xx range: the sign-in page this class was written for arrives
-			//as 203, and every status but 200 is one TransportHttp throws on
+			//the exact code, not a 2xx range: every status but 200 is one TransportHttp throws on
 			int status = response.getStatusLine().getStatusCode();
 			if (status == HttpStatus.SC_OK) {
 				return;
 			}
-			if (closeable == null) {
-				//nothing to close, so nothing changes here: leaving the real body in place keeps
-				//the caller's own reading able to release the socket, which a replacement that
-				//throws would take away
+			InputStream in = null;
+			byte[] content;
+			try {
+				in = body.getContent();
+				ByteArrayOutputStream copy = new ByteArrayOutputStream();
+				in.transferTo(copy);
+				content = copy.toByteArray();
+			} catch (IOException e) {
+				response.setEntity(withMetadataOf(body,
+						new DiscardedBody(body.getContentLength(), status, e)));
+				//the response rather than the body stream where there is one.
+				//HttpResponseProxy.close() reaches ConnectionHolder.close() ->
+				//releaseConnection(false) -> managedConn.close(). The body stream would instead
+				//reach ResponseEntityProxy.streamClosed, which closes the stream it wraps — and
+				//ContentLengthInputStream.close() reads the whole remainder off a connection that
+				//has just failed
+				closeQuietly(closeable != null ? closeable : in);
+				exchange.bodyReleased(closeable);
 				return;
 			}
-			response.setEntity(withMetadataOf(body, new DiscardedBody(body.getContentLength(), status)));
-			//closing the response, never the body stream. HttpResponseProxy.close() reaches
-			//ConnectionHolder.close() -> releaseConnection(false) -> managedConn.close(). The body
-			//stream would instead reach ResponseEntityProxy.streamClosed, which closes the stream
-			//it wraps — and ContentLengthInputStream.close() reads the whole remainder to discard
-			//it, which is the wait this interceptor exists to avoid
+			response.setEntity(withMetadataOf(body, new ByteArrayEntity(content)));
+			//reading to the end has released the connection through httpclient's own stream, so
+			//this close finds a released holder and does nothing; it stays for a stream that
+			//reports its end without releasing
 			closeQuietly(closeable);
 			exchange.bodyReleased(closeable);
 		}
 
 		//the replacement has to carry the original Content-Type and Content-Encoding, so that
-		//ResponseContentEncoding still strips those headers; dropping them would leave
-		//Content-Encoding in place and wake up the gzip path in TransportHttp
+		//ResponseContentEncoding still strips those headers — and, for the copy, still decodes it;
+		//dropping them would leave Content-Encoding in place and wake up the gzip path in
+		//TransportHttp
 		private static <T extends AbstractHttpEntity> T withMetadataOf(HttpEntity original,
 				T replacement) {
 			replacement.setContentType(original.getContentType());
@@ -1024,7 +1077,7 @@ public class B3HttpClientConnection implements HttpConnection {
 	}
 
 	/**
-	 * Stands in for a body closed unread, and says so to anyone who asks for it.
+	 * Stands in for a body whose reading failed, and says so to anyone who asks for it.
 	 * <p>
 	 * It reports the length the body was framed with rather than zero, so that
 	 * ResponseContentEncoding takes the decision it would have taken on the entity being replaced:
@@ -1042,9 +1095,12 @@ public class B3HttpClientConnection implements HttpConnection {
 
 		private final int status;
 
-		DiscardedBody(long framedLength, int status) {
+		private final IOException readFailure;
+
+		DiscardedBody(long framedLength, int status, IOException readFailure) {
 			this.framedLength = framedLength;
 			this.status = status;
+			this.readFailure = readFailure;
 		}
 
 		@Override
@@ -1076,7 +1132,7 @@ public class B3HttpClientConnection implements HttpConnection {
 		//without it a 203 sign-in page and a 500 read identically in a support log
 		private IOException discarded() {
 			return new IOException("the body of this " + status //$NON-NLS-1$
-					+ " response was closed unread: nothing reads the body of a response other than 200"); //$NON-NLS-1$
+					+ " response could not be read", readFailure); //$NON-NLS-1$
 		}
 	}
 
@@ -1136,8 +1192,8 @@ public class B3HttpClientConnection implements HttpConnection {
 		//jgit surfaces it as a failed ls-remote.
 		//The cost is paid by a caller that walks away from a 200 mid-body: closing it now waits out the
 		//server's delivery of the remainder. TransportHttp.openResponse is the live case — it takes a
-		//200, finds a content type it did not ask for, and closes the stream. A non-200 pays nothing:
-		//the interceptor swaps its body for DiscardedBody and never hands the caller a stream
+		//200, finds a content type it did not ask for, and closes the stream. A non-200 pays nothing here:
+		//the interceptor has already read its body into memory, and the caller's stream is that copy
 		@Override
 		public void close() throws IOException {
 			try {
