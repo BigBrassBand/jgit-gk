@@ -44,6 +44,9 @@ package com.bigbrassband.common.apache;
 
 import com.bigbrassband.common.apache.internal.HttpApacheText;
 import org.apache.http.Header;
+import org.apache.http.HeaderElement;
+import org.apache.http.NameValuePair;
+import org.apache.http.ParseException;
 import org.apache.http.HttpClientConnection;
 import org.apache.http.HttpEntity;
 import org.apache.http.HttpEntityEnclosingRequest;
@@ -68,17 +71,20 @@ import org.apache.http.config.Registry;
 import org.apache.http.config.RegistryBuilder;
 import org.apache.http.conn.ConnectionRequest;
 import org.apache.http.conn.HttpClientConnectionManager;
+import org.apache.http.conn.ManagedHttpClientConnection;
 import org.apache.http.conn.routing.HttpRoute;
 import org.apache.http.conn.socket.ConnectionSocketFactory;
 import org.apache.http.conn.socket.PlainConnectionSocketFactory;
 import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
 import org.apache.http.conn.ssl.X509HostnameVerifier;
 import org.apache.http.entity.AbstractHttpEntity;
+import org.apache.http.entity.ByteArrayEntity;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.impl.client.HttpClients;
 import org.apache.http.impl.conn.BasicHttpClientConnectionManager;
 import org.apache.http.protocol.HttpContext;
+import org.apache.http.protocol.HttpCoreContext;
 import org.eclipse.jgit.annotations.NonNull;
 import org.eclipse.jgit.transport.http.HttpConnection;
 import org.eclipse.jgit.util.TemporaryBuffer;
@@ -91,6 +97,7 @@ import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLSession;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManager;
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.FilterInputStream;
 import java.io.IOException;
@@ -98,6 +105,8 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.ref.Cleaner;
 import java.lang.ref.Reference;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -106,12 +115,17 @@ import java.net.InetSocketAddress;
 import java.net.MalformedURLException;
 import java.net.ProtocolException;
 import java.net.Proxy;
+import java.net.Socket;
+import java.net.SocketException;
 import java.net.URL;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.security.KeyManagementException;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
@@ -132,11 +146,16 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_PUT;
  * <li>{@code Exchange} holds the state of one exchange and renders the single verdict the
  * counters are told about. It deliberately reaches neither the connection nor the body stream,
  * which is what lets a cleaner hold it.
- * <li>{@code NonOkBodyCloser} is a response interceptor that closes the connection of every
- * response other than 200, before the caller sees it. Nothing reads such a body, so nothing is
- * read off the wire first — the socket comes back at once.
- * <li>{@code DiscardedBody} is the replacement entity it installs, so that a caller which does
- * ask for one of those bodies is told it is gone rather than handed an empty one.
+ * <li>{@code NonOkBodyBuffer} is a response interceptor that reads the body of every response
+ * other than 200, within a byte limit and a time budget, and releases the connection before the
+ * caller sees it. The caller gets an in-memory copy, and {@link #getResponseMessage()} puts a
+ * {@code text/plain} one after the reason phrase — the only part of a refusal jgit's
+ * {@code TransportHttp} keeps.
+ * <li>{@code CutShortBody} is the entity it installs when that read stops before the end, so that
+ * a caller which asks for the body gets the prefix that was kept and then a
+ * {@link CutShortBodyException}, rather than a prefix it would take for the whole.
+ * <li>{@code Deadline} closes the socket of a non-200 body still being read when its time budget
+ * runs out, from one timer thread shared by the process.
  * <li>{@code TrackedBodyStream} wraps a body handed to the caller and tells the exchange when
  * that body reaches its end or is closed.
  * <li>{@code ClosingConnectionManager} wraps the connection manager and closes every connection
@@ -147,8 +166,8 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_PUT;
  * the connection object as soon as it holds the body stream, so on every fetch this object
  * becomes unreachable while its body is still being read. A single cleanup action on the
  * connection would therefore count each real pack fetch as abandoned. Instead the exchange is
- * settled by whichever comes first: the exec chain returning, for a response already closed
- * unread; the body stream reaching its end or being closed; or collection — of the connection,
+ * settled by whichever comes first: the exec chain returning, for a response already
+ * released; the body stream reaching its end or being closed; or collection — of the connection,
  * or of the stream, two cleaners with the connection's deferring to the stream's while a body is
  * out. The connection also holds the stream it handed out, so the stream's collection cannot
  * precede the connection's — it coincides with it or follows it. A compare-and-set inside
@@ -158,14 +177,24 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_PUT;
  * <b>No cleanup action may reach what it watches.</b> An action able to reach this connection
  * would keep it alive for good, turning the socket leak into a memory leak, so every registered
  * action is a bound method reference on {@code Exchange} — which holds nothing but the
- * {@link Closeable} response. The same constraint read the other way is why
- * {@link Reference#reachabilityFence} appears in {@link #getInputStream()} and in
- * {@code TrackedBodyStream}: without it a cleaner may run while the method it belongs to is
- * still deciding, and close the socket under a stream about to be returned or still being read.
+ * {@link Closeable} response and, for a body cut short, the exception saying why. The same
+ * constraint read the other way is why {@link Reference#reachabilityFence} appears in
+ * {@link #getInputStream()} and in {@code TrackedBodyStream}: without it a cleaner may run while
+ * the method it belongs to is still deciding, and close the socket under a stream about to be
+ * returned or still being read.
  *
  * @since 3.3
  */
 public class B3HttpClientConnection implements HttpConnection {
+	/**
+	 * The most of a non-200 body kept, both as it came off the wire and as decoded for
+	 * {@link #getResponseMessage()}; a longer one is cut short at this many bytes. Telling "longer"
+	 * from "exactly this long" takes one byte more, so the wire read stops at this plus one. Past ten
+	 * times the largest unread body measured in production, the 89,976-byte Azure DevOps sign-in
+	 * page.
+	 */
+	public static final int MAX_NON_OK_BODY_BYTES = 1024 * 1024;
+
 	private static final Cleaner CLEANER = Cleaner.create();
 	private static final AtomicLong initCount = new AtomicLong(0);
 	private static final AtomicLong closeCount = new AtomicLong(0);
@@ -205,6 +234,8 @@ public class B3HttpClientConnection implements HttpConnection {
 
 	private Integer readTimeoutMilliseconds;
 
+	private String nonOkText;
+
 	private Boolean followRedirects;
 
 	private X509HostnameVerifier hostnameverifier;
@@ -231,7 +262,7 @@ public class B3HttpClientConnection implements HttpConnection {
 	/**
 	 * @return number of exchanges whose connection came back, since last call (resets counter).
 	 *         Every way of getting there lands here and none is told apart — a body read to its
-	 *         end, a body closed before it, a response other than 200 closed unread, a response
+	 *         end, a body closed before it, a response other than 200 read whole or cut short, a response
 	 *         with no streaming body to begin with, and a chain that threw over a body still on
 	 *         the socket.
 	 */
@@ -277,10 +308,12 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * @return number of responses whose body was left on the socket and was then never read at
 	 *         all, since last call (resets counter).
 	 *         <p>
-	 *         On the httpclient this builds against, only a 200 reaches here: every other status
-	 *         has its connection closed before the caller sees the response, because {@code
-	 *         ProtocolExec} always hands the interceptor an {@code HttpResponseProxy} and that is
-	 *         {@link Closeable}. A response that is not would take the one branch that closes
+	 *         On the httpclient this builds against, only a 200 reaches here: every other status is
+	 *         released before the caller sees it, because the response is {@link Closeable} —
+	 *         {@code ProtocolExec} always hands the interceptor an {@code HttpResponseProxy}. Its
+	 *         body is read first only when a finite read timeout is set.
+	 *         <p>
+	 *         A response that is not {@link Closeable} would take the one branch that closes
 	 *         nothing, and could be counted here whatever its status.
 	 *         <p>
 	 *         So a body counted here is one the caller asked for and walked away from without
@@ -311,9 +344,6 @@ public class B3HttpClientConnection implements HttpConnection {
 	private CloseableHttpClient getClient() {
 		if (client == null) {
 			HttpClientBuilder clientBuilder = HttpClients.custom();
-			//first, so the entity it replaces is the one that came off the wire rather than the
-			//decompressing wrapper ResponseContentEncoding puts around it
-			clientBuilder.addInterceptorFirst(new NonOkBodyCloser(exchange));
 			HttpClientConnectionManager connectionManager = null;
 			if(httpClientConnectionManagerFactory!=null)
 				connectionManager = httpClientConnectionManagerFactory.getConnectionManager();
@@ -350,7 +380,12 @@ public class B3HttpClientConnection implements HttpConnection {
 				//the builder makes is one this class could not wrap
 				connectionManager = new BasicHttpClientConnectionManager();
 			}
-			clientBuilder.setConnectionManager(new ClosingConnectionManager(connectionManager));
+			ClosingConnectionManager closingManager = new ClosingConnectionManager(connectionManager);
+			clientBuilder.setConnectionManager(closingManager);
+			//first, so the entity it replaces is the one that came off the wire rather than the
+			//decompressing wrapper ResponseContentEncoding puts around it
+			clientBuilder.addInterceptorFirst(
+					new NonOkBodyBuffer(exchange, closingManager, readBudgetMillis()));
 			configBuilder.setCookieSpec(CookieSpecs.STANDARD);
 			clientBuilder.setDefaultRequestConfig(configBuilder.build());
 
@@ -358,6 +393,20 @@ public class B3HttpClientConnection implements HttpConnection {
 		}
 
 		return client;
+	}
+
+	//one read timeout for the whole body: the socket timeout bounds a single read, not the body,
+	//since read() returns as soon as any byte arrives. Not a multiple of it: jgit sets the read
+	//timeout from the transport timeout, minutes long where the appserver configures it, and an
+	//error body nobody may ask for must not hold an indexing thread for several of those.
+	//Zero means the body is not read. A read timeout of zero reaches setSocketTimeout as "wait
+	//forever", and jgit passes exactly that when the repository configures no timeout (RemoteConfig
+	//reads KEY_TIMEOUT with a default of 0), so a single read need never return
+	private long readBudgetMillis() {
+		if (readTimeoutMilliseconds == null || readTimeoutMilliseconds <= 0) {
+			return 0L;
+		}
+		return readTimeoutMilliseconds;
 	}
 
 	private SSLContext getSSLContext() {
@@ -453,10 +502,111 @@ public class B3HttpClientConnection implements HttpConnection {
 		return url;
 	}
 
+	/**
+	 * The reason phrase, followed by the body of a response other than 200 when that body is
+	 * {@code text/plain}. jgit's {@code TransportHttp} builds its exception text from this rather
+	 * than from the body, so this is how a provider's explanation of a refusal reaches a caller —
+	 * Azure DevOps Services, for one, says only "Bad Request" in the status line and names the
+	 * unsupported filter in the body. A body that was cut short contributes the prefix that was
+	 * kept, followed by the {@link CutShortBodyException} message in square brackets.
+	 */
 	@Override
 	public String getResponseMessage() throws IOException {
 		execute();
-		return resp.getStatusLine().getReasonPhrase();
+		String reason = resp.getStatusLine().getReasonPhrase();
+		String bodyText = nonOkBodyText();
+		if (bodyText.isEmpty()) {
+			return reason;
+		}
+		return (reason == null || reason.isEmpty()) ? bodyText : reason + ": " + bodyText; //$NON-NLS-1$
+	}
+
+	//text/plain only: that is the form git servers give a refusal in, while an HTML sign-in page or
+	//an error page would put a whole document of markup into every log line carrying the message.
+	//Computed once: the body is a fixed in-memory copy by now, and decoding it can be the costly part
+	private String nonOkBodyText() {
+		if (nonOkText == null) {
+			nonOkText = readNonOkBodyText();
+		}
+		return nonOkText;
+	}
+
+	private String readNonOkBodyText() {
+		HttpEntity body = resp.getEntity();
+		//a non-streaming entity is the in-memory copy NonOkBodyBuffer installed; a 200 body is still
+		//on its socket and belongs to whoever takes the stream
+		int status = resp.getStatusLine().getStatusCode();
+		if (status == HttpStatus.SC_OK || body == null || body.isStreaming()) {
+			return ""; //$NON-NLS-1$
+		}
+		HeaderElement type = mediaType(body.getContentType());
+		if (type == null || !"text/plain".equalsIgnoreCase(type.getName())) { //$NON-NLS-1$
+			//the body stays out of the message, but a cut does not: whoever reads the message
+			//must not take a refusal whose explanation went unread for one that gave none
+			CutShortBodyException cut = exchange.cutShort();
+			return cut == null ? "" : "[" + cut.getMessage() + "]"; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+		}
+		ByteArrayOutputStream decoded = new ByteArrayOutputStream();
+		String cutShort = null;
+		//the decompressor ResponseContentEncoding put around the copy is not bounded by the wire
+		//read, which counted compressed bytes: a megabyte of gzip can decode to a gigabyte
+		try (InputStream in = body.getContent()) {
+			byte[] chunk = new byte[8192];
+			while (decoded.size() <= MAX_NON_OK_BODY_BYTES) {
+				int n = in.read(chunk, 0,
+						(int) Math.min(chunk.length, MAX_NON_OK_BODY_BYTES + 1L - decoded.size()));
+				if (n < 0) {
+					break;
+				}
+				decoded.write(chunk, 0, n);
+			}
+		} catch (IOException e) {
+			//a body cut short hands over its prefix and then throws CutShortBodyException, through a
+			//decompressor too. Anything else is a body complete on the wire that does not decode,
+			//a corrupt gzip for one, and what was decoded before it is still only a prefix
+			cutShort = (e instanceof CutShortBodyException) ? e.getMessage()
+					: "the body could not be read to its end: " + e; //$NON-NLS-1$
+		}
+		byte[] text = decoded.toByteArray();
+		if (text.length > MAX_NON_OK_BODY_BYTES) {
+			text = Arrays.copyOf(text, MAX_NON_OK_BODY_BYTES);
+			cutShort = CutShortBodyException.message(status, CutShortBodyException.Reason.DECODED_LIMIT,
+					MAX_NON_OK_BODY_BYTES);
+		}
+		String decodedText = new String(text, charsetOf(type)).trim();
+		if (cutShort == null) {
+			return decodedText;
+		}
+		return decodedText.isEmpty() ? "[" + cutShort + "]" //$NON-NLS-1$ //$NON-NLS-2$
+				: decodedText + " [" + cutShort + "]"; //$NON-NLS-1$ //$NON-NLS-2$
+	}
+
+	//the header comes off the wire: a value that does not parse means "not text/plain", and must not
+	//reach getResponseMessage()'s caller as an unchecked exception
+	private static HeaderElement mediaType(Header contentType) {
+		if (contentType == null) {
+			return null;
+		}
+		try {
+			HeaderElement[] elements = contentType.getElements();
+			return elements.length == 0 ? null : elements[0];
+		} catch (ParseException e) {
+			return null;
+		}
+	}
+
+	//the declared charset when there is one and it is known; UTF-8 otherwise, malformed names
+	//included
+	private static Charset charsetOf(HeaderElement mediaType) {
+		NameValuePair charset = mediaType.getParameterByName("charset"); //$NON-NLS-1$
+		if (charset == null || charset.getValue() == null || charset.getValue().isBlank()) {
+			return StandardCharsets.UTF_8;
+		}
+		try {
+			return Charset.forName(charset.getValue().trim());
+		} catch (IllegalArgumentException e) {
+			return StandardCharsets.UTF_8;
+		}
 	}
 
 	private void execute() throws IOException, ClientProtocolException {
@@ -683,6 +833,32 @@ public class B3HttpClientConnection implements HttpConnection {
 		getSSLContext().init(km, tm, random);
 	}
 
+	//On TLS 1.3, SSLSocket.close() reads once more for the peer's close_notify when no input is
+	//buffered, which is the state a body read to its end leaves behind; that read runs under the
+	//socket timeout, and only when the timeout is positive (SSLSocketInputRecord.deplete). A
+	//server is free never to answer, so the timeout is set to 1 ms, which caps that read; 0 would
+	//skip it altogether and serve as well.
+	//On the socket, not the connection: a connection may already be released by the time a caller
+	//gets here, and a pooled one then refuses every call. A socket is never reused, and every
+	//release closes it, so one found closed is left alone
+	private static void stopWaitingForPeerClose(Socket socket) {
+		if (socket == null || socket.isClosed()) {
+			return;
+		}
+		try {
+			socket.setSoTimeout(1);
+		} catch (SocketException e) {
+			//closed in between: there is no close left to wait on
+		}
+	}
+
+	//only while the connection is still leased: a released pooled connection refuses the call
+	private static Socket socketOf(org.apache.http.HttpConnection connection) {
+		return (connection instanceof ManagedHttpClientConnection)
+				? ((ManagedHttpClientConnection) connection).getSocket()
+				: null;
+	}
+
 	private static void closeQuietly(Closeable closeable) {
 		if (closeable != null) {
 			try {
@@ -745,12 +921,24 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * a body the caller finishes later, and leaves alone the idle connections of other users of a
 	 * shared manager. Static for the reason {@code CallerHostnameVerifier} gives: a response reaches
 	 * this through its {@code ConnectionHolder}.
+	 * <p>
+	 * While a non-200 body is being read, a connection this receives still open, which is what a
+	 * release at the end of a reusable response hands it, is closed without waiting for the peer:
+	 * see {@link #stopWaitingForPeerClose}. A non-reusable response ({@code Connection: close},
+	 * HTTP/1.0) is closed by {@code ConnectionHolder} before this sees it, and that close can still
+	 * wait up to a read timeout for a peer that keeps its side of TLS 1.3 open.
 	 */
 	private static final class ClosingConnectionManager implements HttpClientConnectionManager {
 		private final HttpClientConnectionManager delegate;
 
+		private volatile boolean readingNonOkBody;
+
 		ClosingConnectionManager(HttpClientConnectionManager delegate) {
 			this.delegate = delegate;
+		}
+
+		void readingNonOkBody(boolean reading) {
+			readingNonOkBody = reading;
 		}
 
 		@Override
@@ -762,6 +950,9 @@ public class B3HttpClientConnection implements HttpConnection {
 		public void releaseConnection(HttpClientConnection conn, Object newState,
 				long validDuration, TimeUnit timeUnit) {
 			try {
+				if (readingNonOkBody) {
+					stopWaitingForPeerClose(socketOf(conn));
+				}
 				closeQuietly(conn);
 			} finally {
 				delegate.releaseConnection(conn, newState, validDuration, timeUnit);
@@ -822,9 +1013,22 @@ public class B3HttpClientConnection implements HttpConnection {
 
 		private volatile Closeable response;
 
+		private volatile CutShortBodyException cutShort;
+
 		void bodyOnSocket(Closeable resp) {
 			this.response = resp;
+			//each hop starts clean, so a redirect hop cut short says nothing about the response the
+			//caller ends up with
+			this.cutShort = null;
 			state.set(State.BODY_ON_SOCKET);
+		}
+
+		void bodyCutShort(CutShortBodyException why) {
+			this.cutShort = why;
+		}
+
+		CutShortBodyException cutShort() {
+			return cutShort;
 		}
 
 		void bodyReleased(Closeable resp) {
@@ -857,7 +1061,7 @@ public class B3HttpClientConnection implements HttpConnection {
 		}
 
 		//the exec chain has returned, so no further hop can revise the verdict; a response already
-		//closed unread is counted here rather than waiting to be collected
+		//released is counted here rather than waiting to be collected
 		void exchangeSettled() {
 			if (state.get() == State.RELEASED) {
 				account();
@@ -933,26 +1137,38 @@ public class B3HttpClientConnection implements HttpConnection {
 	}
 
 	/**
-	 * Closes the connection of any response other than 200, before the caller sees it.
+	 * Reads the body of any response other than 200 and releases the connection, before the caller
+	 * sees it; the caller gets an in-memory copy in its place.
 	 * <p>
-	 * Nothing on the transport path reads such a body. jgit's {@code TransportHttp} throws on the
-	 * status line — from {@code openResponse} on every service call, and from each {@code case} of
-	 * {@code connect} that is not {@code HTTP_OK} — and builds its message out of the status line
-	 * rather than the body. So there is nothing there to preserve, and reading the body off the
-	 * wire first would only make the caller wait for bytes on their way to being discarded.
+	 * jgit's {@code TransportHttp} throws on the status line — from {@code openResponse} on every
+	 * service call, and from each {@code case} of {@code connect} that is not {@code HTTP_OK} — and
+	 * builds its message from {@link #getResponseMessage()}, never from the body. A provider that
+	 * explains a refusal does so in the body, so the body has to be read here, while the socket is
+	 * still ours, for {@code getResponseMessage()} to pass it on.
 	 * <p>
-	 * That rule is the transport's, not the whole fork's: {@code org.eclipse.jgit.lfs.SmudgeFilter}
-	 * accepts 203 alongside 200 and parses that body as JSON, and it takes its connection from the
-	 * same process-wide {@code HttpTransport} connection factory. Under this
-	 * interceptor such a response arrives discarded. The LFS module is out of scope deliberately
-	 * rather than by oversight: 203 is the status of the sign-in page this class exists to stop
-	 * leaking, so admitting it would give up the fix. Anything wiring this factory and LFS together
-	 * needs a different answer than this one.
+	 * The read is bounded twice, because it waits on a body nobody may ever ask for: by
+	 * {@link #MAX_NON_OK_BODY_BYTES} bytes off the wire, and by a time budget of one read timeout
+	 * over the whole read, enforced by {@code Deadline} closing the socket when it runs out, so
+	 * that no pace of dribbling keeps the read going past it. A body that hits either is cut
+	 * short: the response is closed, which releases the socket without reading the remainder, and
+	 * {@code CutShortBody} hands on the prefix that was kept followed by a
+	 * {@link CutShortBodyException} saying why. A body that breaks in mid-flight ends the same way.
+	 * A body cut short, or read to its end on a reusable response, does not wait on release for the
+	 * peer to close its side of TLS (see {@code stopWaitingForPeerClose}); a non-reusable response
+	 * read to its end can, as {@code ClosingConnectionManager} explains. Without a finite read
+	 * timeout nothing bounds the read, so the body is not read at all and is cut short at zero
+	 * bytes. All of this assumes a response the interceptor can close, which on this httpclient is
+	 * every response (see {@link #getStreamedUnreadCount()}); without one, a body is left in place
+	 * or released by a close that drains it at the server's pace.
+	 * <p>
+	 * The copy is kept whatever its content type, so that any caller which asks for it gets the
+	 * real body: {@code org.eclipse.jgit.lfs.SmudgeFilter} accepts 203 alongside 200 and parses that
+	 * body as JSON, taking its connection from the same process-wide {@code HttpTransport} connection
+	 * factory. Which part of it goes into the message is {@code getResponseMessage()}'s decision.
 	 * <p>
 	 * The fork's other consumer cannot reach this code at all: GIJ Data Center installs a
 	 * same-named factory from {@code org.eclipse.jgit.transport.http.apache}, not this package, and
-	 * pins the {@code -r-gk} line, where this package does not exist. Both are checkable from this
-	 * repository; whether DC also uses LFS is not, and does not matter while that holds.
+	 * pins the {@code -r-gk} line, where this package does not exist.
 	 * <p>
 	 * A 200 is left alone entirely: that body is the one the caller asked for, and the caller's
 	 * own reading is what releases its socket.
@@ -963,18 +1179,24 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * rather than an empty {@code ContentLengthInputStream}, and {@code BasicHttpEntity.isStreaming}
 	 * singles that instance out as not streaming. So {@code ResponseEntityProxy.enchance} never
 	 * wraps it, no connection holder is attached, and the exec chain has already released the
-	 * socket. The caller then gets the real body — empty and whole, with nothing here to discard.
+	 * socket. The caller then gets the real body — empty and whole, with nothing here to copy.
 	 * <p>
 	 * Runs once per hop, so a redirect chain resolved inside httpclient reaches it for every
-	 * response in the chain: the 3xx hops are closed here, the final 200 is not. That is the same
+	 * response in the chain: the 3xx hops are read here, the final 200 is not. That is the same
 	 * socket-per-hop count as without this interceptor, since httpclient leases again for each hop
 	 * and ClosingConnectionManager closes every socket as it is released.
 	 */
-	private static final class NonOkBodyCloser implements HttpResponseInterceptor {
+	private static final class NonOkBodyBuffer implements HttpResponseInterceptor {
 		private final Exchange exchange;
 
-		NonOkBodyCloser(Exchange exchange) {
+		private final ClosingConnectionManager manager;
+
+		private final long budgetMillis;
+
+		NonOkBodyBuffer(Exchange exchange, ClosingConnectionManager manager, long budgetMillis) {
 			this.exchange = exchange;
+			this.manager = manager;
+			this.budgetMillis = budgetMillis;
 		}
 
 		@Override
@@ -990,31 +1212,132 @@ public class B3HttpClientConnection implements HttpConnection {
 				exchange.bodyReleased(closeable);
 				return;
 			}
-			//the exact code, not a 2xx range: the sign-in page this class was written for arrives
-			//as 203, and every status but 200 is one TransportHttp throws on
+			//the exact code, not a 2xx range: every status but 200 is one TransportHttp throws on
 			int status = response.getStatusLine().getStatusCode();
 			if (status == HttpStatus.SC_OK) {
 				return;
 			}
-			if (closeable == null) {
-				//nothing to close, so nothing changes here: leaving the real body in place keeps
-				//the caller's own reading able to release the socket, which a replacement that
-				//throws would take away
+			//taken now, while the connection is still leased: a read that fails releases it
+			Socket socket = socketOf(HttpCoreContext.adapt(context).getConnection());
+			long framedLength = body.getContentLength();
+			if (budgetMillis <= 0) {
+				if (closeable == null) {
+					//nothing to close and nothing to bound a read by: leaving the real body in place
+					//keeps the caller's own reading able to release the socket
+					return;
+				}
+				cutShort(response, body, closeable, null, socket, new CutShortBody(new byte[0],
+						new CutShortBodyException(status, CutShortBodyException.Reason.NOT_READ, 0, null),
+						framedLength));
 				return;
 			}
-			response.setEntity(withMetadataOf(body, new DiscardedBody(body.getContentLength(), status)));
-			//closing the response, never the body stream. HttpResponseProxy.close() reaches
-			//ConnectionHolder.close() -> releaseConnection(false) -> managedConn.close(). The body
-			//stream would instead reach ResponseEntityProxy.streamClosed, which closes the stream
-			//it wraps — and ContentLengthInputStream.close() reads the whole remainder to discard
-			//it, which is the wait this interceptor exists to avoid
-			closeQuietly(closeable);
+			ByteArrayOutputStream head = newBuffer(framedLength);
+			InputStream in = null;
+			CutShortBodyException.Reason stopped;
+			IOException failure = null;
+			manager.readingNonOkBody(true);
+			try {
+				in = body.getContent();
+				stopped = read(in, head, budgetMillis, socket);
+			} catch (IOException e) {
+				stopped = CutShortBodyException.Reason.READ_FAILED;
+				failure = e;
+			} finally {
+				manager.readingNonOkBody(false);
+			}
+			if (stopped == null) {
+				response.setEntity(withMetadataOf(body, new ByteArrayEntity(head.toByteArray())));
+				//reading to the end has released the connection through httpclient's own stream, so
+				//this close finds a released holder and does nothing; it stays for a stream that
+				//reports its end without releasing
+				closeQuietly(closeable);
+				exchange.bodyReleased(closeable);
+				return;
+			}
+			byte[] kept = Arrays.copyOf(head.toByteArray(), Math.min(head.size(), MAX_NON_OK_BODY_BYTES));
+			cutShort(response, body, closeable, in, socket, new CutShortBody(kept,
+					new CutShortBodyException(status, stopped, kept.length, failure), framedLength));
+		}
+
+		private void cutShort(HttpResponse response, HttpEntity original, Closeable closeable,
+				InputStream in, Socket socket, CutShortBody replacement) {
+			response.setEntity(withMetadataOf(original, replacement));
+			exchange.bodyCutShort(replacement.failure);
+			if (closeable != null) {
+				//ConnectionHolder closes the connection itself before handing it to the manager, so
+				//the manager's flag comes too late for this close
+				stopWaitingForPeerClose(socket);
+			}
+			//the response rather than the body stream where there is one.
+			//HttpResponseProxy.close() reaches ConnectionHolder.close() -> releaseConnection(false)
+			//-> managedConn.close(). The body stream would instead reach
+			//ResponseEntityProxy.streamClosed, which closes the stream it wraps — and
+			//ContentLengthInputStream.close() reads the whole remainder to discard it, which is the
+			//wait the bounds exist to cut off. Without a response to close, the stream is the only
+			//handle left, and its close pays that wait one socket timeout per read
+			closeQuietly(closeable != null ? closeable : in);
 			exchange.bodyReleased(closeable);
 		}
 
+		//a declared length is only allocated up front when it fits the bound: the number comes off
+		//the wire, and sizing a buffer to a claimed 2 GB would hand a remote server an
+		//OutOfMemoryError to fire at will
+		private static ByteArrayOutputStream newBuffer(long framedLength) {
+			if (framedLength > 0 && framedLength <= MAX_NON_OK_BODY_BYTES) {
+				return new ByteArrayOutputStream((int) framedLength);
+			}
+			return new ByteArrayOutputStream();
+		}
+
+		//null when the body ended within the bound, head then holding all of it; otherwise why the
+		//read stopped, head holding at most MAX_NON_OK_BODY_BYTES + 1 bytes.
+		//The deadline is enforced from outside the read: a socket timeout bounds one socket read,
+		//and one in.read() can make many of them (a chunk-size line, TLS records), each of which a
+		//server can satisfy just in time. Without a socket to close, only the check between reads
+		//is left, and a read in progress at the deadline runs until the server lets it finish.
+		private static CutShortBodyException.Reason read(InputStream in, ByteArrayOutputStream head,
+				long budgetMillis, Socket socket) throws IOException {
+			long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMillis);
+			Deadline deadline = Deadline.schedule(socket, budgetMillis);
+			try {
+				byte[] chunk = new byte[8192];
+				long read = 0;
+				while (read <= MAX_NON_OK_BODY_BYTES) {
+					//subtraction, not comparison: it stays correct across a nanoTime wrap
+					if (System.nanoTime() - deadlineNanos >= 0) {
+						return CutShortBodyException.Reason.TIME_BUDGET;
+					}
+					int n;
+					try {
+						n = in.read(chunk, 0, (int) Math.min(chunk.length, MAX_NON_OK_BODY_BYTES + 1L - read));
+					} catch (IOException e) {
+						if (deadline != null && deadline.fired()) {
+							return CutShortBodyException.Reason.TIME_BUDGET;
+						}
+						throw e;
+					}
+					//an SSLSocket closed by the deadline between two reads answers the next one with -1
+					//rather than a throw, and a body framed by the connection's end passes that on as
+					//its own end
+					if (n < 0) {
+						return (deadline != null && deadline.fired()) ? CutShortBodyException.Reason.TIME_BUDGET
+								: null;
+					}
+					head.write(chunk, 0, n);
+					read += n;
+				}
+				return CutShortBodyException.Reason.BYTE_LIMIT;
+			} finally {
+				if (deadline != null) {
+					deadline.disarm();
+				}
+			}
+		}
+
 		//the replacement has to carry the original Content-Type and Content-Encoding, so that
-		//ResponseContentEncoding still strips those headers; dropping them would leave
-		//Content-Encoding in place and wake up the gzip path in TransportHttp
+		//ResponseContentEncoding still strips those headers — and, for the copy, still decodes it;
+		//dropping them would leave Content-Encoding in place and wake up the gzip path in
+		//TransportHttp
 		private static <T extends AbstractHttpEntity> T withMetadataOf(HttpEntity original,
 				T replacement) {
 			replacement.setContentType(original.getContentType());
@@ -1024,32 +1347,112 @@ public class B3HttpClientConnection implements HttpConnection {
 	}
 
 	/**
-	 * Stands in for a body closed unread, and says so to anyone who asks for it.
+	 * Closes the socket a non-200 body is being read from once the time budget for that read runs
+	 * out, so that a read blocked on it throws instead of waiting on the server.
 	 * <p>
-	 * It reports the length the body was framed with rather than zero, so that
+	 * It holds the {@link Socket} of one hop and nothing else — neither this connection nor its
+	 * {@code Exchange}, which a cleaner watches — and it can only close that socket while armed. The
+	 * reader disarms it as soon as its loop ends, before anything releases or closes the connection
+	 * on purpose. What is left is a body that reaches its end inside the read that the timer
+	 * interrupts: httpclient released the connection as part of that read, so the close lands on a
+	 * socket already closed and is a no-op. A socket is never reused: a connection reopened for the
+	 * next hop gets a new one.
+	 * <p>
+	 * One daemon thread serves the whole process, and a disarmed task is cancelled and removed from
+	 * its queue at once, so the cost per non-200 body read is one scheduled task: one allocation and
+	 * a queue insert and removal.
+	 */
+	private static final class Deadline implements Runnable {
+		private static final ScheduledThreadPoolExecutor TIMER = newTimer();
+
+		private final Socket socket;
+
+		private final AtomicBoolean armed = new AtomicBoolean(true);
+
+		private volatile boolean fired;
+
+		private volatile Future<?> task;
+
+		private Deadline(Socket socket) {
+			this.socket = socket;
+		}
+
+		//null when there is no socket to close: the check between reads is then the only bound
+		static Deadline schedule(Socket socket, long budgetMillis) {
+			if (socket == null) {
+				return null;
+			}
+			Deadline deadline = new Deadline(socket);
+			deadline.task = TIMER.schedule(deadline, budgetMillis, TimeUnit.MILLISECONDS);
+			return deadline;
+		}
+
+		@Override
+		public void run() {
+			if (!armed.compareAndSet(true, false)) {
+				return;
+			}
+			fired = true;
+			//this thread serves every connection's deadline, so the close must not wait on a peer
+			stopWaitingForPeerClose(socket);
+			closeQuietly(socket);
+		}
+
+		boolean fired() {
+			return fired;
+		}
+
+		void disarm() {
+			armed.set(false);
+			Future<?> scheduled = task;
+			if (scheduled != null) {
+				scheduled.cancel(false);
+			}
+		}
+
+		private static ScheduledThreadPoolExecutor newTimer() {
+			ScheduledThreadPoolExecutor timer = new ScheduledThreadPoolExecutor(1, runnable -> {
+				Thread thread = new Thread(runnable, "B3HttpClientConnection-body-deadline"); //$NON-NLS-1$
+				thread.setDaemon(true);
+				return thread;
+			});
+			timer.setRemoveOnCancelPolicy(true);
+			return timer;
+		}
+	}
+
+	/**
+	 * Stands in for a body whose reading stopped before its end: its stream hands over the prefix
+	 * that was kept, then throws the {@link CutShortBodyException} saying why, every time it is
+	 * asked for.
+	 * <p>
+	 * It reports the length the body was framed with rather than the prefix's, so that
 	 * ResponseContentEncoding takes the decision it would have taken on the entity being replaced:
 	 * that class skips its work — leaving Content-Encoding in place — only for a length of exactly
-	 * 0, and the caller would then hold a response whose Content-Encoding describes nothing. It
-	 * stops there: TransportHttp.openInputStream calls getInputStream() before it tests
-	 * isGzipContent, so on a discarded body it throws below and never reaches the gzip wrap.
+	 * 0, and a body cut short at zero bytes would otherwise keep a Content-Encoding that describes
+	 * nothing. The cost is a length nobody should size a buffer by: {@code EntityUtils.toByteArray}
+	 * allocates whatever it claims.
 	 * <p>
 	 * {@code isStreaming()} is false, and load-bearing: RedirectExec calls
 	 * {@code EntityUtils.consume} on every hop it follows, and that reads the content only for a
 	 * streaming entity. Reporting true would send it reading a body whose socket is already gone.
 	 */
-	private static final class DiscardedBody extends AbstractHttpEntity {
+	private static final class CutShortBody extends AbstractHttpEntity {
+		private final byte[] prefix;
+
+		private final CutShortBodyException failure;
+
 		private final long framedLength;
 
-		private final int status;
-
-		DiscardedBody(long framedLength, int status) {
+		CutShortBody(byte[] prefix, CutShortBodyException failure, long framedLength) {
+			this.prefix = prefix;
+			this.failure = failure;
 			this.framedLength = framedLength;
-			this.status = status;
 		}
 
 		@Override
 		public boolean isRepeatable() {
-			return false;
+			return true;
 		}
 
 		@Override
@@ -1063,20 +1466,54 @@ public class B3HttpClientConnection implements HttpConnection {
 		}
 
 		@Override
-		public InputStream getContent() throws IOException {
-			throw discarded();
+		public InputStream getContent() {
+			return new CutShortStream(prefix, failure);
 		}
 
 		@Override
 		public void writeTo(OutputStream outStream) throws IOException {
-			throw discarded();
+			outStream.write(prefix);
+			throw failure;
+		}
+	}
+
+	private static final class CutShortStream extends InputStream {
+		private final byte[] prefix;
+
+		private final CutShortBodyException failure;
+
+		private int next;
+
+		CutShortStream(byte[] prefix, CutShortBodyException failure) {
+			this.prefix = prefix;
+			this.failure = failure;
 		}
 
-		//the status is the whole diagnostic value here: this exception is all a caller gets, and
-		//without it a 203 sign-in page and a 500 read identically in a support log
-		private IOException discarded() {
-			return new IOException("the body of this " + status //$NON-NLS-1$
-					+ " response was closed unread: nothing reads the body of a response other than 200"); //$NON-NLS-1$
+		@Override
+		public int read() throws IOException {
+			if (next < prefix.length) {
+				return prefix[next++] & 0xff;
+			}
+			throw failure;
+		}
+
+		@Override
+		public int read(byte[] b, int off, int len) throws IOException {
+			if (len == 0) {
+				return 0;
+			}
+			if (next >= prefix.length) {
+				throw failure;
+			}
+			int n = Math.min(len, prefix.length - next);
+			System.arraycopy(prefix, next, b, off, n);
+			next += n;
+			return n;
+		}
+
+		@Override
+		public int available() {
+			return prefix.length - next;
 		}
 	}
 
@@ -1136,8 +1573,8 @@ public class B3HttpClientConnection implements HttpConnection {
 		//jgit surfaces it as a failed ls-remote.
 		//The cost is paid by a caller that walks away from a 200 mid-body: closing it now waits out the
 		//server's delivery of the remainder. TransportHttp.openResponse is the live case — it takes a
-		//200, finds a content type it did not ask for, and closes the stream. A non-200 pays nothing:
-		//the interceptor swaps its body for DiscardedBody and never hands the caller a stream
+		//200, finds a content type it did not ask for, and closes the stream. A non-200 pays nothing here:
+		//the interceptor has already read its body into memory, and the caller's stream is that copy
 		@Override
 		public void close() throws IOException {
 			try {
