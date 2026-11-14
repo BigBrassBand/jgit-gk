@@ -44,6 +44,9 @@ package com.bigbrassband.common.apache;
 
 import com.bigbrassband.common.apache.internal.HttpApacheText;
 import org.apache.http.Header;
+import org.apache.http.HeaderElement;
+import org.apache.http.NameValuePair;
+import org.apache.http.ParseException;
 import org.apache.http.HttpClientConnection;
 import org.apache.http.HttpEntity;
 import org.apache.http.HttpEntityEnclosingRequest;
@@ -75,12 +78,12 @@ import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
 import org.apache.http.conn.ssl.X509HostnameVerifier;
 import org.apache.http.entity.AbstractHttpEntity;
 import org.apache.http.entity.ByteArrayEntity;
-import org.apache.http.entity.ContentType;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.impl.client.HttpClients;
 import org.apache.http.impl.conn.BasicHttpClientConnectionManager;
 import org.apache.http.protocol.HttpContext;
+import org.apache.http.protocol.HttpCoreContext;
 import org.eclipse.jgit.annotations.NonNull;
 import org.eclipse.jgit.transport.http.HttpConnection;
 import org.eclipse.jgit.util.TemporaryBuffer;
@@ -99,6 +102,7 @@ import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.SocketTimeoutException;
 import java.lang.ref.Cleaner;
 import java.lang.ref.Reference;
 import java.util.concurrent.TimeUnit;
@@ -112,12 +116,12 @@ import java.net.Proxy;
 import java.net.URL;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
 import java.security.KeyManagementException;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
@@ -176,9 +180,11 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_PUT;
  */
 public class B3HttpClientConnection implements HttpConnection {
 	/**
-	 * The most of a non-200 body read into memory; a longer one is cut short at this many bytes,
-	 * counted as they came off the wire. Past ten times the largest unread body measured in
-	 * production, the 89,976-byte Azure DevOps sign-in page.
+	 * The most of a non-200 body kept, both as it came off the wire and as decoded for
+	 * {@link #getResponseMessage()}; a longer one is cut short at this many bytes. Telling "longer"
+	 * from "exactly this long" takes one byte more, so the wire read stops at this plus one. Past ten
+	 * times the largest unread body measured in production, the 89,976-byte Azure DevOps sign-in
+	 * page.
 	 */
 	public static final int MAX_NON_OK_BODY_BYTES = 1024 * 1024;
 
@@ -220,6 +226,8 @@ public class B3HttpClientConnection implements HttpConnection {
 	private boolean ignoreConnectTimeoutMillisecondsSets=false;
 
 	private Integer readTimeoutMilliseconds;
+
+	private String nonOkText;
 
 	private Boolean followRedirects;
 
@@ -504,36 +512,87 @@ public class B3HttpClientConnection implements HttpConnection {
 	}
 
 	//text/plain only: that is the form git servers give a refusal in, while an HTML sign-in page or
-	//an error page would put a whole document of markup into every log line carrying the message
+	//an error page would put a whole document of markup into every log line carrying the message.
+	//Computed once: the body is a fixed in-memory copy by now, and decoding it can be the costly part
 	private String nonOkBodyText() {
+		if (nonOkText == null) {
+			nonOkText = readNonOkBodyText();
+		}
+		return nonOkText;
+	}
+
+	private String readNonOkBodyText() {
 		HttpEntity body = resp.getEntity();
 		//a non-streaming entity is the in-memory copy NonOkBodyBuffer installed; a 200 body is still
 		//on its socket and belongs to whoever takes the stream
-		if (resp.getStatusLine().getStatusCode() == HttpStatus.SC_OK || body == null
-				|| body.isStreaming()) {
+		int status = resp.getStatusLine().getStatusCode();
+		if (status == HttpStatus.SC_OK || body == null || body.isStreaming()) {
 			return ""; //$NON-NLS-1$
 		}
-		ContentType type = ContentType.getLenient(body);
-		if (type == null || !ContentType.TEXT_PLAIN.getMimeType().equalsIgnoreCase(type.getMimeType())) {
+		HeaderElement type = mediaType(body.getContentType());
+		if (type == null || !"text/plain".equalsIgnoreCase(type.getName())) { //$NON-NLS-1$
 			return ""; //$NON-NLS-1$
 		}
 		ByteArrayOutputStream decoded = new ByteArrayOutputStream();
 		String cutShort = null;
+		//the decompressor ResponseContentEncoding put around the copy is not bounded by the wire
+		//read, which counted compressed bytes: a megabyte of gzip can decode to a gigabyte
 		try (InputStream in = body.getContent()) {
-			in.transferTo(decoded);
+			byte[] chunk = new byte[8192];
+			while (decoded.size() <= MAX_NON_OK_BODY_BYTES) {
+				int n = in.read(chunk, 0,
+						(int) Math.min(chunk.length, MAX_NON_OK_BODY_BYTES + 1L - decoded.size()));
+				if (n < 0) {
+					break;
+				}
+				decoded.write(chunk, 0, n);
+			}
 		} catch (IOException e) {
 			//a body cut short hands over its prefix and then throws; a gzipped prefix fails in the
 			//decompressor instead. Either way what was decoded is a prefix and has to say so
 			cutShort = (e instanceof CutShortBodyException) ? e.getMessage()
 					: "the body could not be read to its end: " + e; //$NON-NLS-1$
 		}
-		//the declared charset when there is one and it is known; UTF-8 otherwise
-		Charset charset = type.getCharset() != null ? type.getCharset() : StandardCharsets.UTF_8;
-		String text = new String(decoded.toByteArray(), charset).trim();
-		if (cutShort == null) {
-			return text;
+		byte[] text = decoded.toByteArray();
+		if (text.length > MAX_NON_OK_BODY_BYTES) {
+			text = Arrays.copyOf(text, MAX_NON_OK_BODY_BYTES);
+			cutShort = CutShortBodyException.message(status, CutShortBodyException.Reason.DECODED_LIMIT,
+					MAX_NON_OK_BODY_BYTES);
 		}
-		return text.isEmpty() ? "[" + cutShort + "]" : text + " [" + cutShort + "]"; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+		String decodedText = new String(text, charsetOf(type)).trim();
+		if (cutShort == null) {
+			return decodedText;
+		}
+		return decodedText.isEmpty() ? "[" + cutShort + "]" //$NON-NLS-1$ //$NON-NLS-2$
+				: decodedText + " [" + cutShort + "]"; //$NON-NLS-1$ //$NON-NLS-2$
+	}
+
+	//the header comes off the wire: a value that does not parse means "not text/plain", and must not
+	//reach getResponseMessage()'s caller as an unchecked exception
+	private static HeaderElement mediaType(Header contentType) {
+		if (contentType == null) {
+			return null;
+		}
+		try {
+			HeaderElement[] elements = contentType.getElements();
+			return elements.length == 0 ? null : elements[0];
+		} catch (ParseException e) {
+			return null;
+		}
+	}
+
+	//the declared charset when there is one and it is known; UTF-8 otherwise, malformed names
+	//included
+	private static Charset charsetOf(HeaderElement mediaType) {
+		NameValuePair charset = mediaType.getParameterByName("charset"); //$NON-NLS-1$
+		if (charset == null || charset.getValue() == null || charset.getValue().isBlank()) {
+			return StandardCharsets.UTF_8;
+		}
+		try {
+			return Charset.forName(charset.getValue().trim());
+		} catch (IllegalArgumentException e) {
+			return StandardCharsets.UTF_8;
+		}
 	}
 
 	private void execute() throws IOException, ClientProtocolException {
@@ -1020,12 +1079,16 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * still ours, for {@code getResponseMessage()} to pass it on.
 	 * <p>
 	 * The read is bounded twice, because it waits on a body nobody may ever ask for: by
-	 * {@link #MAX_NON_OK_BODY_BYTES}, counted as the bytes came off the wire, and by a time budget
-	 * of one read timeout. A body that hits either is cut short: the response is closed, which
-	 * releases the socket without reading the remainder, and {@code CutShortBody} hands on the
-	 * prefix that was kept followed by a {@link CutShortBodyException} saying why. A body that
-	 * breaks in mid-flight ends the same way. Without a finite read timeout nothing bounds a single
-	 * read, so the body is not read at all and is cut short at zero bytes.
+	 * {@link #MAX_NON_OK_BODY_BYTES} bytes off the wire, and by a time budget of one read timeout,
+	 * which holds inside a read as well as between reads because each read's socket timeout is
+	 * lowered to what is left of the budget. A body that hits either is cut short: the response is
+	 * closed, which releases the socket without reading the remainder, and {@code CutShortBody}
+	 * hands on the prefix that was kept followed by a {@link CutShortBodyException} saying why. A
+	 * body that breaks in mid-flight ends the same way. Without a finite read timeout nothing bounds
+	 * the read, so the body is not read at all and is cut short at zero bytes. All of this assumes a
+	 * response the interceptor can close, which on this httpclient is every response (see
+	 * {@link #getStreamedUnreadCount()}); without one, a body is left in place or released by a
+	 * close that drains it at the server's pace.
 	 * <p>
 	 * The copy is kept whatever its content type, so that any caller which asks for it gets the
 	 * real body: {@code org.eclipse.jgit.lfs.SmudgeFilter} accepts 203 alongside 200 and parses that
@@ -1098,7 +1161,8 @@ public class B3HttpClientConnection implements HttpConnection {
 			IOException failure = null;
 			try {
 				in = body.getContent();
-				stopped = read(in, head, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMillis));
+				stopped = read(in, head, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMillis),
+						HttpCoreContext.adapt(context).getConnection());
 			} catch (IOException e) {
 				stopped = CutShortBodyException.Reason.READ_FAILED;
 				failure = e;
@@ -1143,27 +1207,58 @@ public class B3HttpClientConnection implements HttpConnection {
 
 		//null when the body ended within the bound, head then holding all of it; otherwise why the
 		//read stopped, head holding at most MAX_NON_OK_BODY_BYTES + 1 bytes.
-		//The deadline is only tested between reads, so the last read can still take a whole socket
-		//timeout past it, and the worst case is two read timeouts. Bounding that read too would
-		//mean handing setSocketTimeout a shrinking value, and zero there means "wait forever", not
-		//"give up now".
+		//Each read gets what is left of the budget as its socket timeout, never less than 1 ms:
+		//zero there means "wait forever". Without the connection in the context only the check
+		//between reads is left, and the last read can then overrun the deadline by a whole
+		//read timeout.
 		private static CutShortBodyException.Reason read(InputStream in, ByteArrayOutputStream head,
-				long deadlineNanos) throws IOException {
-			byte[] chunk = new byte[8192];
-			long read = 0;
-			while (read <= MAX_NON_OK_BODY_BYTES) {
-				//subtraction, not comparison: it stays correct across a nanoTime wrap
-				if (System.nanoTime() - deadlineNanos >= 0) {
-					return CutShortBodyException.Reason.TIME_BUDGET;
+				long deadlineNanos, org.apache.http.HttpConnection socket) throws IOException {
+			int originalTimeout = socket == null ? -1 : socket.getSocketTimeout();
+			try {
+				byte[] chunk = new byte[8192];
+				long read = 0;
+				while (read <= MAX_NON_OK_BODY_BYTES) {
+					//subtraction, not comparison: it stays correct across a nanoTime wrap
+					long remainingMillis = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
+					if (remainingMillis <= 0) {
+						return CutShortBodyException.Reason.TIME_BUDGET;
+					}
+					if (socket != null) {
+						socket.setSocketTimeout((int) Math.min(remainingMillis, Integer.MAX_VALUE));
+					}
+					int n;
+					try {
+						n = in.read(chunk, 0, (int) Math.min(chunk.length, MAX_NON_OK_BODY_BYTES + 1L - read));
+					} catch (SocketTimeoutException e) {
+						if (socket != null) {
+							return CutShortBodyException.Reason.TIME_BUDGET;
+						}
+						throw e;
+					}
+					if (n < 0) {
+						return null;
+					}
+					head.write(chunk, 0, n);
+					read += n;
 				}
-				int n = in.read(chunk, 0, (int) Math.min(chunk.length, MAX_NON_OK_BODY_BYTES + 1L - read));
-				if (n < 0) {
-					return null;
-				}
-				head.write(chunk, 0, n);
-				read += n;
+				return CutShortBodyException.Reason.BYTE_LIMIT;
+			} finally {
+				restoreTimeout(socket, originalTimeout);
 			}
-			return CutShortBodyException.Reason.BYTE_LIMIT;
+		}
+
+		//every path after this closes the connection, so the lowered timeout could not reach another
+		//exchange anyway; restoring it keeps that true should a path ever stop closing. A body read
+		//to its end has already released the connection, and a pooled one then refuses the call
+		private static void restoreTimeout(org.apache.http.HttpConnection socket, int originalTimeout) {
+			if (socket == null || originalTimeout < 0) {
+				return;
+			}
+			try {
+				socket.setSocketTimeout(originalTimeout);
+			} catch (IllegalStateException e) {
+				//released already: nothing is left that would read with the lowered value
+			}
 		}
 
 		//the replacement has to carry the original Content-Type and Content-Encoding, so that

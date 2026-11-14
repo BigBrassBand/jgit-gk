@@ -15,8 +15,14 @@ public class CutShortBodyException extends IOException {
 	 * Why the reading stopped.
 	 */
 	public enum Reason {
-		/** The body was longer than {@link B3HttpClientConnection#MAX_NON_OK_BODY_BYTES}. */
+		/** The body was longer than {@link B3HttpClientConnection#MAX_NON_OK_BODY_BYTES} on the wire. */
 		BYTE_LIMIT,
+		/**
+		 * The body, once decoded for {@link B3HttpClientConnection#getResponseMessage()}, was longer
+		 * than {@link B3HttpClientConnection#MAX_NON_OK_BODY_BYTES}. Only that message names this
+		 * reason: no body stream throws it, since the stream itself is not cut.
+		 */
+		DECODED_LIMIT,
 		/** The body was still arriving when the time budget for reading it ran out. */
 		TIME_BUDGET,
 		/** Reading the body failed; the cause is that failure. */
@@ -30,8 +36,7 @@ public class CutShortBodyException extends IOException {
 	private final int bytesKept;
 
 	CutShortBodyException(int status, Reason reason, int bytesKept, IOException cause) {
-		super("the body of this " + status + " response was cut short after " + bytesKept //$NON-NLS-1$ //$NON-NLS-2$
-				+ " bytes: " + describe(reason), cause); //$NON-NLS-1$
+		super(message(status, reason, bytesKept), cause);
 		this.reason = reason;
 		this.bytesKept = bytesKept;
 	}
@@ -44,17 +49,25 @@ public class CutShortBodyException extends IOException {
 	}
 
 	/**
-	 * @return how many bytes of the body, as they came off the wire, were kept and handed over
-	 *         before this was thrown
+	 * @return how many bytes of the body were kept: as they came off the wire, or for
+	 *         {@link Reason#DECODED_LIMIT} as decoded
 	 */
 	public int getBytesKept() {
 		return bytesKept;
+	}
+
+	static String message(int status, Reason reason, int bytesKept) {
+		return "the body of this " + status + " response was cut short after " + bytesKept //$NON-NLS-1$ //$NON-NLS-2$
+				+ " bytes: " + describe(reason); //$NON-NLS-1$
 	}
 
 	private static String describe(Reason reason) {
 		switch (reason) {
 		case BYTE_LIMIT:
 			return "longer than " + B3HttpClientConnection.MAX_NON_OK_BODY_BYTES + " bytes"; //$NON-NLS-1$ //$NON-NLS-2$
+		case DECODED_LIMIT:
+			return "longer than " + B3HttpClientConnection.MAX_NON_OK_BODY_BYTES //$NON-NLS-1$
+					+ " bytes once decoded"; //$NON-NLS-1$
 		case TIME_BUDGET:
 			return "still arriving when the time budget for reading it ran out"; //$NON-NLS-1$
 		case READ_FAILED:
