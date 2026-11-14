@@ -116,6 +116,7 @@ import java.net.MalformedURLException;
 import java.net.ProtocolException;
 import java.net.Proxy;
 import java.net.Socket;
+import java.net.SocketException;
 import java.net.URL;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
@@ -835,11 +836,26 @@ public class B3HttpClientConnection implements HttpConnection {
 	//SSLSocket.close() on TLS 1.3 waits up to the socket timeout for the peer's close_notify when no
 	//input is buffered (SSLSocketInputRecord.deplete), which is the state a body read to its end
 	//leaves behind, and a server is free never to answer. One millisecond is the shortest wait
-	//setSocketTimeout can express: zero means forever. Called only on a connection about to close
-	private static void stopWaitingForPeerClose(org.apache.http.HttpConnection connection) {
-		if (connection != null) {
-			connection.setSocketTimeout(1);
+	//setSoTimeout can express: zero means forever.
+	//On the socket, not the connection: a connection may already be released by the time a caller
+	//gets here, and a pooled one then refuses every call. A socket is never reused, and every
+	//release closes it, so one found closed is left alone
+	private static void stopWaitingForPeerClose(Socket socket) {
+		if (socket == null || socket.isClosed()) {
+			return;
 		}
+		try {
+			socket.setSoTimeout(1);
+		} catch (SocketException e) {
+			//closed in between: there is no close left to wait on
+		}
+	}
+
+	//only while the connection is still leased: a released pooled connection refuses the call
+	private static Socket socketOf(org.apache.http.HttpConnection connection) {
+		return (connection instanceof ManagedHttpClientConnection)
+				? ((ManagedHttpClientConnection) connection).getSocket()
+				: null;
 	}
 
 	private static void closeQuietly(Closeable closeable) {
@@ -905,8 +921,11 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * shared manager. Static for the reason {@code CallerHostnameVerifier} gives: a response reaches
 	 * this through its {@code ConnectionHolder}.
 	 * <p>
-	 * While a non-200 body is being read, the release that reaching its end triggers inside that
-	 * read does not wait for the peer: see {@link #stopWaitingForPeerClose}.
+	 * While a non-200 body is being read, a connection this receives still open, which is what a
+	 * release at the end of a reusable response hands it, is closed without waiting for the peer:
+	 * see {@link #stopWaitingForPeerClose}. A non-reusable response ({@code Connection: close},
+	 * HTTP/1.0) is closed by {@code ConnectionHolder} before this sees it, and that close can still
+	 * wait up to a read timeout for a peer that keeps its side of TLS 1.3 open.
 	 */
 	private static final class ClosingConnectionManager implements HttpClientConnectionManager {
 		private final HttpClientConnectionManager delegate;
@@ -931,7 +950,7 @@ public class B3HttpClientConnection implements HttpConnection {
 				long validDuration, TimeUnit timeUnit) {
 			try {
 				if (readingNonOkBody) {
-					stopWaitingForPeerClose(conn);
+					stopWaitingForPeerClose(socketOf(conn));
 				}
 				closeQuietly(conn);
 			} finally {
@@ -1133,8 +1152,9 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * short: the response is closed, which releases the socket without reading the remainder, and
 	 * {@code CutShortBody} hands on the prefix that was kept followed by a
 	 * {@link CutShortBodyException} saying why. A body that breaks in mid-flight ends the same way.
-	 * Neither a body read to its end nor one cut short waits on release for the peer to close its
-	 * side of TLS: see {@code stopWaitingForPeerClose}. Without a finite read timeout nothing bounds
+	 * A body cut short, or read to its end on a reusable response, does not wait on release for the
+	 * peer to close its side of TLS (see {@code stopWaitingForPeerClose}); a non-reusable response
+	 * read to its end can, as {@code ClosingConnectionManager} explains. Without a finite read timeout nothing bounds
 	 * the read, so the body is not read at all and is cut short at zero bytes. All of this assumes a
 	 * response the interceptor can close, which on this httpclient is every response (see
 	 * {@link #getStreamedUnreadCount()}); without one, a body is left in place or released by a
@@ -1196,7 +1216,8 @@ public class B3HttpClientConnection implements HttpConnection {
 			if (status == HttpStatus.SC_OK) {
 				return;
 			}
-			org.apache.http.HttpConnection connection = HttpCoreContext.adapt(context).getConnection();
+			//taken now, while the connection is still leased: a read that fails releases it
+			Socket socket = socketOf(HttpCoreContext.adapt(context).getConnection());
 			long framedLength = body.getContentLength();
 			if (budgetMillis <= 0) {
 				if (closeable == null) {
@@ -1204,7 +1225,7 @@ public class B3HttpClientConnection implements HttpConnection {
 					//keeps the caller's own reading able to release the socket
 					return;
 				}
-				cutShort(response, body, closeable, null, connection, new CutShortBody(new byte[0],
+				cutShort(response, body, closeable, null, socket, new CutShortBody(new byte[0],
 						new CutShortBodyException(status, CutShortBodyException.Reason.NOT_READ, 0, null),
 						framedLength));
 				return;
@@ -1216,7 +1237,7 @@ public class B3HttpClientConnection implements HttpConnection {
 			manager.readingNonOkBody(true);
 			try {
 				in = body.getContent();
-				stopped = read(in, head, budgetMillis, connection);
+				stopped = read(in, head, budgetMillis, socket);
 			} catch (IOException e) {
 				stopped = CutShortBodyException.Reason.READ_FAILED;
 				failure = e;
@@ -1233,18 +1254,18 @@ public class B3HttpClientConnection implements HttpConnection {
 				return;
 			}
 			byte[] kept = Arrays.copyOf(head.toByteArray(), Math.min(head.size(), MAX_NON_OK_BODY_BYTES));
-			cutShort(response, body, closeable, in, connection, new CutShortBody(kept,
+			cutShort(response, body, closeable, in, socket, new CutShortBody(kept,
 					new CutShortBodyException(status, stopped, kept.length, failure), framedLength));
 		}
 
 		private void cutShort(HttpResponse response, HttpEntity original, Closeable closeable,
-				InputStream in, org.apache.http.HttpConnection connection, CutShortBody replacement) {
+				InputStream in, Socket socket, CutShortBody replacement) {
 			response.setEntity(withMetadataOf(original, replacement));
 			exchange.bodyCutShort(replacement.failure);
 			if (closeable != null) {
 				//ConnectionHolder closes the connection itself before handing it to the manager, so
 				//the manager's flag comes too late for this close
-				stopWaitingForPeerClose(connection);
+				stopWaitingForPeerClose(socket);
 			}
 			//the response rather than the body stream where there is one.
 			//HttpResponseProxy.close() reaches ConnectionHolder.close() -> releaseConnection(false)
@@ -1274,9 +1295,9 @@ public class B3HttpClientConnection implements HttpConnection {
 		//server can satisfy just in time. Without a socket to close, only the check between reads
 		//is left, and a read in progress at the deadline runs until the server lets it finish.
 		private static CutShortBodyException.Reason read(InputStream in, ByteArrayOutputStream head,
-				long budgetMillis, org.apache.http.HttpConnection connection) throws IOException {
+				long budgetMillis, Socket socket) throws IOException {
 			long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMillis);
-			Deadline deadline = Deadline.schedule(connection, budgetMillis);
+			Deadline deadline = Deadline.schedule(socket, budgetMillis);
 			try {
 				byte[] chunk = new byte[8192];
 				long read = 0;
@@ -1351,13 +1372,8 @@ public class B3HttpClientConnection implements HttpConnection {
 			this.socket = socket;
 		}
 
-		//null when the connection exposes no socket to close: the check between reads is then
-		//the only bound
-		static Deadline schedule(org.apache.http.HttpConnection connection, long budgetMillis) {
-			if (!(connection instanceof ManagedHttpClientConnection)) {
-				return null;
-			}
-			Socket socket = ((ManagedHttpClientConnection) connection).getSocket();
+		//null when there is no socket to close: the check between reads is then the only bound
+		static Deadline schedule(Socket socket, long budgetMillis) {
 			if (socket == null) {
 				return null;
 			}
@@ -1372,6 +1388,8 @@ public class B3HttpClientConnection implements HttpConnection {
 				return;
 			}
 			fired = true;
+			//this thread serves every connection's deadline, so the close must not wait on a peer
+			stopWaitingForPeerClose(socket);
 			closeQuietly(socket);
 		}
 
