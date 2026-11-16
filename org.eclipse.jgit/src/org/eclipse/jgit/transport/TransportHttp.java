@@ -33,6 +33,9 @@ import static org.eclipse.jgit.util.HttpSupport.HDR_WWW_AUTHENTICATE;
 import static org.eclipse.jgit.util.HttpSupport.METHOD_GET;
 import static org.eclipse.jgit.util.HttpSupport.METHOD_POST;
 
+// BBB customization begin
+import com.bigbrassband.common.apache.HttpStatusTransportException;
+// BBB customization end
 import java.io.BufferedInputStream;
 import java.io.BufferedReader;
 import java.io.File;
@@ -1876,8 +1879,10 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 		void openResponse() throws IOException {
 			final int status = HttpSupport.response(conn);
 			if (status != HttpConnection.HTTP_OK) {
-				throw new TransportException(uri, status + " " //$NON-NLS-1$
-						+ conn.getResponseMessage());
+				// BBB customization begin
+				throw new HttpStatusTransportException(uri, status,
+						status + " " + conn.getResponseMessage()); //$NON-NLS-1$
+				// BBB customization end
 			}
 
 			// BBB customization begin
