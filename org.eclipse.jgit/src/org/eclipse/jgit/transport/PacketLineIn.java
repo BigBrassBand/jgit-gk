@@ -14,6 +14,9 @@ package org.eclipse.jgit.transport;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
+// BBB customization begin
+import com.bigbrassband.common.apache.ErrInFetchAnswerPackProtocolException;
+// BBB customization end
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
@@ -118,7 +121,10 @@ public class PacketLineIn {
 			return AckNackResult.ACK_READY;
 		}
 		if (line.startsWith("ERR ")) { //$NON-NLS-1$
-			throw new PackProtocolException(line.substring(4));
+			// BBB customization begin
+			throw new ErrInFetchAnswerPackProtocolException(line.substring(4),
+					line.substring(4));
+			// BBB customization end
 		}
 		throw new PackProtocolException(
 				MessageFormat.format(JGitText.get().expectedACKNAKGot, line));
@@ -148,7 +154,10 @@ public class PacketLineIn {
 			}
 		}
 		if (line.startsWith("ERR ")) //$NON-NLS-1$
-			throw new PackProtocolException(line.substring(4));
+			// BBB customization begin
+			throw new ErrInFetchAnswerPackProtocolException(line.substring(4),
+					line.substring(4));
+			// BBB customization end
 		throw new PackProtocolException(MessageFormat.format(JGitText.get().expectedACKNAKGot, line));
 	}
 
