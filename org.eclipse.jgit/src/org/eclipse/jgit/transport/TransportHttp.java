@@ -34,6 +34,7 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_GET;
 import static org.eclipse.jgit.util.HttpSupport.METHOD_POST;
 
 // BBB customization begin
+import com.bigbrassband.common.apache.HttpStatusInFetchAnswerException;
 import com.bigbrassband.common.apache.HttpStatusTransportException;
 // BBB customization end
 import java.io.BufferedInputStream;
@@ -1611,6 +1612,9 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 				throws TransportException {
 			svc = new MultiRequestService(SVC_UPLOAD_PACK,
 					getProtocolVersion());
+			// BBB customization begin
+			svc.answersFetchRequest = true;
+			// BBB customization end
 			try (InputStream svcIn = new SilentInputStream(
 					svc.getInputStream());
 					OutputStream svcOut = svc.getOutputStream()) {
@@ -1677,6 +1681,13 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 		protected final TransferConfig.ProtocolVersion protocolVersion;
 
 		final UnionInputStream in;
+
+		// BBB customization begin
+		// Set for the requests of a fetch, which carry its wants and filter;
+		// the v2 ls-refs request goes through a service of its own and does
+		// not set it.
+		boolean answersFetchRequest;
+		// BBB customization end
 
 		Service(String serviceName,
 				TransferConfig.ProtocolVersion protocolVersion) {
@@ -1880,8 +1891,12 @@ public class TransportHttp extends HttpTransport implements WalkTransport,
 			final int status = HttpSupport.response(conn);
 			if (status != HttpConnection.HTTP_OK) {
 				// BBB customization begin
-				throw new HttpStatusTransportException(uri, status,
-						status + " " + conn.getResponseMessage()); //$NON-NLS-1$
+				String message = status + " " + conn.getResponseMessage(); //$NON-NLS-1$
+				if (answersFetchRequest) {
+					throw new HttpStatusInFetchAnswerException(uri, status,
+							message);
+				}
+				throw new HttpStatusTransportException(uri, status, message);
 				// BBB customization end
 			}
 

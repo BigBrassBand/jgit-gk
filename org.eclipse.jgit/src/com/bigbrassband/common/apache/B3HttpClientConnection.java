@@ -117,6 +117,7 @@ import java.net.ProtocolException;
 import java.net.Proxy;
 import java.net.Socket;
 import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
@@ -154,8 +155,8 @@ import static org.eclipse.jgit.util.HttpSupport.METHOD_PUT;
  * <li>{@code CutShortBody} is the entity it installs when that read stops before the end, so that
  * a caller which asks for the body gets the prefix that was kept and then a
  * {@link CutShortBodyException}, rather than a prefix it would take for the whole.
- * <li>{@code Deadline} closes the socket of a non-200 body still being read when its time budget
- * runs out, from one timer thread shared by the process.
+ * <li>{@code Deadline} shuts the input of the socket a non-200 body is still being read from when
+ * its time budget runs out, from one timer thread shared by the process.
  * <li>{@code TrackedBodyStream} wraps a body handed to the caller and tells the exchange when
  * that body reaches its end or is closed.
  * <li>{@code ClosingConnectionManager} wraps the connection manager and closes every connection
@@ -201,6 +202,8 @@ public class B3HttpClientConnection implements HttpConnection {
 	private static final AtomicLong abandonedCount = new AtomicLong(0);
 	private static final AtomicLong streamedUnreadCount = new AtomicLong(0);
 	private static final AtomicLong streamAbandonedCount = new AtomicLong(0);
+
+	private static volatile DeadlineScheduler deadlineScheduler;
 
 	private final B3HttpClientConnectionFactory.HttpClientConnectionManagerFactory httpClientConnectionManagerFactory;
 	private final Exchange exchange = new Exchange();
@@ -1148,8 +1151,8 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * <p>
 	 * The read is bounded twice, because it waits on a body nobody may ever ask for: by
 	 * {@link #MAX_NON_OK_BODY_BYTES} bytes off the wire, and by a time budget of one read timeout
-	 * over the whole read, enforced by {@code Deadline} closing the socket when it runs out, so
-	 * that no pace of dribbling keeps the read going past it. A body that hits either is cut
+	 * over the whole read, enforced by {@code Deadline} shutting the socket's input when it runs
+	 * out, so that no pace of dribbling keeps the read going past it. A body that hits either is cut
 	 * short: the response is closed, which releases the socket without reading the remainder, and
 	 * {@code CutShortBody} hands on the prefix that was kept followed by a
 	 * {@link CutShortBodyException} saying why. A body that breaks in mid-flight ends the same way.
@@ -1238,7 +1241,8 @@ public class B3HttpClientConnection implements HttpConnection {
 			manager.readingNonOkBody(true);
 			try {
 				in = body.getContent();
-				stopped = read(in, head, budgetMillis, socket);
+				stopped = read(in, head, budgetMillis, socket,
+						framedLength >= 0 || body.isChunked());
 			} catch (IOException e) {
 				stopped = CutShortBodyException.Reason.READ_FAILED;
 				failure = e;
@@ -1293,34 +1297,44 @@ public class B3HttpClientConnection implements HttpConnection {
 		//read stopped, head holding at most MAX_NON_OK_BODY_BYTES + 1 bytes.
 		//The deadline is enforced from outside the read: a socket timeout bounds one socket read,
 		//and one in.read() can make many of them (a chunk-size line, TLS records), each of which a
-		//server can satisfy just in time. Without a socket to close, only the check between reads
+		//server can satisfy just in time. Without a socket to shut, only the check between reads
 		//is left, and a read in progress at the deadline runs until the server lets it finish.
+		//selfDelimited: the body is framed by a length or by chunks, not by the connection's end
 		private static CutShortBodyException.Reason read(InputStream in, ByteArrayOutputStream head,
-				long budgetMillis, Socket socket) throws IOException {
+				long budgetMillis, Socket socket, boolean selfDelimited) throws IOException {
 			long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMillis);
 			Deadline deadline = Deadline.schedule(socket, budgetMillis);
 			try {
 				byte[] chunk = new byte[8192];
 				long read = 0;
 				while (read <= MAX_NON_OK_BODY_BYTES) {
-					//subtraction, not comparison: it stays correct across a nanoTime wrap
-					if (System.nanoTime() - deadlineNanos >= 0) {
+					//only without a deadline: between reads, a body whose last bytes have arrived but
+					//whose end is not yet read looks like one still arriving. With a deadline, the
+					//shutdown ends the read instead, and bytes httpcore has buffered are still read;
+					//without one, this check is the only bound
+					if (deadline == null && budgetElapsed(deadlineNanos)) {
 						return CutShortBodyException.Reason.TIME_BUDGET;
 					}
 					int n;
 					try {
 						n = in.read(chunk, 0, (int) Math.min(chunk.length, MAX_NON_OK_BODY_BYTES + 1L - read));
 					} catch (IOException e) {
-						if (deadline != null && deadline.fired()) {
+						//the socket timeout is the budget too, so it can end the read before the
+						//deadline has fired; any other failure keeps its own cause
+						if ((deadline != null && deadline.fired())
+								|| (e instanceof SocketTimeoutException && budgetElapsed(deadlineNanos))) {
 							return CutShortBodyException.Reason.TIME_BUDGET;
 						}
 						throw e;
 					}
-					//an SSLSocket closed by the deadline between two reads answers the next one with -1
-					//rather than a throw, and a body framed by the connection's end passes that on as
-					//its own end
+					//httpcore throws on a length or chunked body that ends early, so -1 there is the
+					//body's own end, even after the deadline has fired. A socket whose input the
+					//deadline shut answers -1 (plain) or throws (TLS); either way the read ends, and
+					//fired names the cause. A body framed by the connection's end cannot tell its end
+					//from the deadline's, and is taken as cut short once the deadline has fired
 					if (n < 0) {
-						return (deadline != null && deadline.fired()) ? CutShortBodyException.Reason.TIME_BUDGET
+						return (!selfDelimited && deadline != null && deadline.fired())
+								? CutShortBodyException.Reason.TIME_BUDGET
 								: null;
 					}
 					head.write(chunk, 0, n);
@@ -1332,6 +1346,11 @@ public class B3HttpClientConnection implements HttpConnection {
 					deadline.disarm();
 				}
 			}
+		}
+
+		//subtraction, not comparison: it stays correct across a nanoTime wrap
+		private static boolean budgetElapsed(long deadlineNanos) {
+			return System.nanoTime() - deadlineNanos >= 0;
 		}
 
 		//the replacement has to carry the original Content-Type and Content-Encoding, so that
@@ -1347,16 +1366,59 @@ public class B3HttpClientConnection implements HttpConnection {
 	}
 
 	/**
-	 * Closes the socket a non-200 body is being read from once the time budget for that read runs
-	 * out, so that a read blocked on it throws instead of waiting on the server.
+	 * Test seam: decides when the deadline of a non-200 body read runs, in place of the shared timer;
+	 * {@code null} restores the timer. A race between that deadline and the read cannot be
+	 * reproduced otherwise: holding the deadline back lets the socket timeout end the read first,
+	 * and running it at once shuts the input before a body already received is read.
+	 * <p>
+	 * Package-private on purpose: the tests live in jiragitcloud and reach it through a class of
+	 * their own declared in this package. The setting is process-wide, so a test that changes it
+	 * must restore it, and must not run alongside another test that reads a non-200 body.
+	 *
+	 * @param scheduler
+	 *            what schedules each deadline from now on, or {@code null} for the shared timer
+	 */
+	static void scheduleBodyDeadlinesWith(DeadlineScheduler scheduler) {
+		deadlineScheduler = scheduler;
+	}
+
+	/**
+	 * Test seam: see {@link #scheduleBodyDeadlinesWith}.
+	 */
+	interface DeadlineScheduler {
+		/**
+		 * @param deadline
+		 *            shuts the input of the body's socket when run; running it after the read has
+		 *            ended does nothing
+		 * @param budgetMillis
+		 *            when the shared timer would run it, from now
+		 * @return what the reader cancels once its read ends
+		 */
+		Future<?> schedule(Runnable deadline, long budgetMillis);
+	}
+
+	/**
+	 * Shuts the input of the socket a non-200 body is being read from once the time budget for that
+	 * read runs out, so that a read blocked on it ends instead of waiting on the server.
+	 * <p>
+	 * The input, not the socket: on TLS a close writes {@code close_notify}, a socket write has no
+	 * timeout, and a peer that stopped reading while the send buffer is full would hold the one
+	 * thread every connection's deadline runs on. Shutting the input writes nothing, with one edge:
+	 * on TLS 1.2 and earlier, a peer's close_notify or end of stream processed in the same instant
+	 * the deadline fires can send the shutdown down the close_notify path, which writes. The reader
+	 * then closes the socket on its own thread, in {@code cutShort}, and that close can still block
+	 * on such a peer: it hangs that one caller, as any close of such a socket does in httpclient,
+	 * but not the deadlines of the other connections.
 	 * <p>
 	 * It holds the {@link Socket} of one hop and nothing else — neither this connection nor its
-	 * {@code Exchange}, which a cleaner watches — and it can only close that socket while armed. The
-	 * reader disarms it as soon as its loop ends, before anything releases or closes the connection
-	 * on purpose. What is left is a body that reaches its end inside the read that the timer
-	 * interrupts: httpclient released the connection as part of that read, so the close lands on a
-	 * socket already closed and is a no-op. A socket is never reused: a connection reopened for the
-	 * next hop gets a new one.
+	 * {@code Exchange}, which a cleaner watches — and it can only shut that socket's input while
+	 * armed. The reader disarms it as soon as its loop ends, before anything releases or closes the
+	 * connection on purpose. What is left is a body that reaches its end as the timer fires: the
+	 * shutdown lands either on a socket httpclient has already released and closed, where it does
+	 * nothing, or on one whose remaining bytes httpcore has already buffered, which {@code read}
+	 * still takes as whole when the body is framed by a length or by chunks; bytes still in the
+	 * kernel or the TLS record buffer are dropped by the shutdown, and that body is cut short. A
+	 * socket is never reused: a connection reopened for the next hop gets a new one.
 	 * <p>
 	 * One daemon thread serves the whole process, and a disarmed task is cancelled and removed from
 	 * its queue at once, so the cost per non-200 body read is one scheduled task: one allocation and
@@ -1377,13 +1439,15 @@ public class B3HttpClientConnection implements HttpConnection {
 			this.socket = socket;
 		}
 
-		//null when there is no socket to close: the check between reads is then the only bound
+		//null when there is no socket to shut: the check between reads is then the only bound
 		static Deadline schedule(Socket socket, long budgetMillis) {
 			if (socket == null) {
 				return null;
 			}
 			Deadline deadline = new Deadline(socket);
-			deadline.task = TIMER.schedule(deadline, budgetMillis, TimeUnit.MILLISECONDS);
+			DeadlineScheduler scheduler = deadlineScheduler;
+			deadline.task = (scheduler != null) ? scheduler.schedule(deadline, budgetMillis)
+					: TIMER.schedule(deadline, budgetMillis, TimeUnit.MILLISECONDS);
 			return deadline;
 		}
 
@@ -1393,9 +1457,12 @@ public class B3HttpClientConnection implements HttpConnection {
 				return;
 			}
 			fired = true;
-			//this thread serves every connection's deadline, so the close must not wait on a peer
-			stopWaitingForPeerClose(socket);
-			closeQuietly(socket);
+			try {
+				socket.shutdownInput();
+			} catch (IOException e) {
+				//an SSLSocket throws here for want of the peer's close_notify, after shutting the
+				//input all the same; a plain socket throws only when already closed
+			}
 		}
 
 		boolean fired() {

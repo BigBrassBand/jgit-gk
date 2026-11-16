@@ -24,6 +24,12 @@ import static org.eclipse.jgit.transport.GitProtocolConstants.PACKET_SHALLOW;
 import static org.eclipse.jgit.transport.GitProtocolConstants.PACKET_UNSHALLOW;
 import static org.eclipse.jgit.transport.GitProtocolConstants.PACKET_WANT;
 
+// BBB customization begin
+import com.bigbrassband.common.apache.ErrInFetchAnswerPackProtocolException;
+import com.bigbrassband.common.apache.ErrInFetchAnswerRemoteRepositoryException;
+import com.bigbrassband.common.apache.FetchAnswerFailure;
+import java.util.LinkedHashMap;
+// BBB customization end
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -41,7 +47,6 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import org.eclipse.jgit.errors.PackProtocolException;
-import org.eclipse.jgit.errors.RemoteRepositoryException;
 import org.eclipse.jgit.errors.TransportException;
 import org.eclipse.jgit.internal.JGitText;
 import org.eclipse.jgit.lib.AnyObjectId;
@@ -249,6 +254,11 @@ public abstract class BasePackFetchConnection extends BasePackConnection
 	 * server.
 	 */
 	private final FilterSpec filterSpec;
+
+	// BBB customization begin
+	// The wants sendWants wrote, without those it skipped as already present.
+	private final Map<String, ObjectId> sentWants = new LinkedHashMap<>();
+	// BBB customization end
 
 	/**
 	 * Create a new connection to fetch using the native git transport.
@@ -467,10 +477,23 @@ public abstract class BasePackFetchConnection extends BasePackConnection
 			close();
 			return; // Caller should test (or just know) this themselves.
 		} catch (IOException | RuntimeException err) {
+			// BBB customization begin
+			attachWants(err);
+			// BBB customization end
 			close();
 			throw new TransportException(err.getMessage(), err);
 		}
 	}
+
+	// BBB customization begin
+	private void attachWants(Throwable err) {
+		for (Throwable t = err; t != null; t = t.getCause()) {
+			if (t instanceof FetchAnswerFailure failure) {
+				failure.setWants(sentWants);
+			}
+		}
+	}
+	// BBB customization end
 
 	private void doFetchV2(ProgressMonitor monitor, Collection<Ref> want,
 			OutputStream outputStream, boolean hasObjects)
@@ -535,7 +558,10 @@ public abstract class BasePackFetchConnection extends BasePackConnection
 		String line = pckIn.readString();
 		// If we sent a done, we may have an error reply here.
 		if (sentDone && line.startsWith(PACKET_ERR)) {
-			throw new RemoteRepositoryException(uri, line.substring(4));
+			// BBB customization begin
+			throw new ErrInFetchAnswerRemoteRepositoryException(uri,
+					line.substring(4));
+			// BBB customization end
 		}
 
 		if (GitProtocolConstants.SECTION_SHALLOW_INFO.equals(line)) {
@@ -550,6 +576,15 @@ public abstract class BasePackFetchConnection extends BasePackConnection
 
 		// "wanted-refs" and "packfile-uris" would have to be
 		// handled here in that order.
+		// BBB customization begin
+		// The check above sees only the first line after done; an ERR after "ready" or after shallow-info reaches here.
+		if (line.startsWith(PACKET_ERR)) {
+			throw new ErrInFetchAnswerPackProtocolException(
+					MessageFormat.format(JGitText.get().expectedGot,
+							GitProtocolConstants.SECTION_PACKFILE, line),
+					line.substring(4));
+		}
+		// BBB customization end
 		if (!GitProtocolConstants.SECTION_PACKFILE.equals(line)) {
 			throw new PackProtocolException(
 					MessageFormat.format(JGitText.get().expectedGot,
@@ -629,6 +664,16 @@ public abstract class BasePackFetchConnection extends BasePackConnection
 			PacketLineIn input, ProgressMonitor monitor)
 			throws IOException, CancelledException {
 		String line = input.readString();
+		// BBB customization begin
+		// A remote refusing an argument of a request without done answers it
+		// with an ERR in place of this section.
+		if (line.startsWith(PACKET_ERR)) {
+			throw new ErrInFetchAnswerPackProtocolException(
+					MessageFormat.format(JGitText.get().expectedGot,
+							GitProtocolConstants.SECTION_ACKNOWLEDGMENTS, line),
+					line.substring(4));
+		}
+		// BBB customization end
 		if (!GitProtocolConstants.SECTION_ACKNOWLEDGMENTS.equals(line)) {
 			throw new PackProtocolException(MessageFormat.format(
 					JGitText.get().expectedGot,
@@ -793,6 +838,9 @@ public abstract class BasePackFetchConnection extends BasePackConnection
 	private boolean sendWants(Collection<Ref> want, PacketLineOut p,
 			boolean hasObjects)
 			throws IOException {
+		// BBB customization begin
+		sentWants.clear();
+		// BBB customization end
 		boolean first = true;
 		for (Ref r : want) {
 			ObjectId objectId = r.getObjectId();
@@ -825,6 +873,9 @@ public abstract class BasePackFetchConnection extends BasePackConnection
 			first = false;
 			line.append('\n');
 			p.writeString(line.toString());
+			// BBB customization begin
+			sentWants.put(r.getName(), objectId);
+			// BBB customization end
 		}
 		if (first) {
 			return false;
