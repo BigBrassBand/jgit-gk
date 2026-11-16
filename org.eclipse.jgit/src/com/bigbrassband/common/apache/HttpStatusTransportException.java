@@ -5,9 +5,11 @@ import org.eclipse.jgit.transport.URIish;
 
 /**
  * A smart HTTP service request (upload-pack or receive-pack) answered with a
- * status JGit has no handling of its own for: anything but 200, 401, 403, 404
- * and a redirect it follows. The message is JGit's own for this failure; the
- * status is carried as a number so that a caller need not parse it.
+ * status other than 200 that reached the response check. A 401, 403, 404 or a
+ * followed redirect is handled before it, except for a request whose body
+ * overflowed the post buffer, which skips that handling. The message is JGit's
+ * own for this failure; the status is carried as a number so that a caller need
+ * not parse it.
  */
 public class HttpStatusTransportException extends TransportException {
 	private static final long serialVersionUID = 1L;
