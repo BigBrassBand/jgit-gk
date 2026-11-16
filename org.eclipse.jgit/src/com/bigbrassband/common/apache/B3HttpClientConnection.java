@@ -117,6 +117,7 @@ import java.net.ProtocolException;
 import java.net.Proxy;
 import java.net.Socket;
 import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
@@ -201,6 +202,7 @@ public class B3HttpClientConnection implements HttpConnection {
 	private static final AtomicLong abandonedCount = new AtomicLong(0);
 	private static final AtomicLong streamedUnreadCount = new AtomicLong(0);
 	private static final AtomicLong streamAbandonedCount = new AtomicLong(0);
+
 	private static volatile DeadlineScheduler deadlineScheduler;
 
 	private final B3HttpClientConnectionFactory.HttpClientConnectionManagerFactory httpClientConnectionManagerFactory;
@@ -1306,11 +1308,11 @@ public class B3HttpClientConnection implements HttpConnection {
 				byte[] chunk = new byte[8192];
 				long read = 0;
 				while (read <= MAX_NON_OK_BODY_BYTES) {
-					//only without a deadline: here a body whose last bytes are in but whose end is not
-					//read yet looks like one still arriving, and would be cut short. A deadline stops
-					//the read itself, which still takes what is buffered; without one, this check is
-					//the only bound, and that body can still be cut short
-					if (deadline == null && budgetSpent(null, deadlineNanos)) {
+					//only without a deadline: between reads, a body whose last bytes have arrived but
+					//whose end is not yet read looks like one still arriving. With a deadline, the
+					//shutdown ends the read instead, and bytes httpcore has buffered are still read;
+					//without one, this check is the only bound
+					if (deadline == null && budgetElapsed(deadlineNanos)) {
 						return CutShortBodyException.Reason.TIME_BUDGET;
 					}
 					int n;
@@ -1318,17 +1320,18 @@ public class B3HttpClientConnection implements HttpConnection {
 						n = in.read(chunk, 0, (int) Math.min(chunk.length, MAX_NON_OK_BODY_BYTES + 1L - read));
 					} catch (IOException e) {
 						//the socket timeout is the budget too, so it can end the read before the
-						//deadline has fired
-						if (budgetSpent(deadline, deadlineNanos)) {
+						//deadline has fired; any other failure keeps its own cause
+						if ((deadline != null && deadline.fired())
+								|| (e instanceof SocketTimeoutException && budgetElapsed(deadlineNanos))) {
 							return CutShortBodyException.Reason.TIME_BUDGET;
 						}
 						throw e;
 					}
 					//httpcore throws on a length or chunked body that ends early, so -1 there is the
 					//body's own end, even after the deadline has fired. A socket whose input the
-					//deadline shut answers -1 rather than a throw, so a body framed by the
-					//connection's end cannot tell its end from the deadline's, and is taken as cut
-					//short once the deadline has fired
+					//deadline shut answers -1 (plain) or throws (TLS); either way the read ends, and
+					//fired names the cause. A body framed by the connection's end cannot tell its end
+					//from the deadline's, and is taken as cut short once the deadline has fired
 					if (n < 0) {
 						return (!selfDelimited && deadline != null && deadline.fired())
 								? CutShortBodyException.Reason.TIME_BUDGET
@@ -1345,10 +1348,9 @@ public class B3HttpClientConnection implements HttpConnection {
 			}
 		}
 
-		//whichever timer got there first; the clock by subtraction, not comparison, which stays
-		//correct across a nanoTime wrap
-		private static boolean budgetSpent(Deadline deadline, long deadlineNanos) {
-			return (deadline != null && deadline.fired()) || System.nanoTime() - deadlineNanos >= 0;
+		//subtraction, not comparison: it stays correct across a nanoTime wrap
+		private static boolean budgetElapsed(long deadlineNanos) {
+			return System.nanoTime() - deadlineNanos >= 0;
 		}
 
 		//the replacement has to carry the original Content-Type and Content-Encoding, so that
@@ -1401,7 +1403,9 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * <p>
 	 * The input, not the socket: on TLS a close writes {@code close_notify}, a socket write has no
 	 * timeout, and a peer that stopped reading while the send buffer is full would hold the one
-	 * thread every connection's deadline runs on. Shutting the input writes nothing. The reader
+	 * thread every connection's deadline runs on. Shutting the input writes nothing, with one edge:
+	 * on TLS 1.2 and earlier, a peer's close_notify or end of stream processed in the same instant
+	 * the deadline fires can send the shutdown down the close_notify path, which writes. The reader
 	 * then closes the socket on its own thread, in {@code cutShort}, and that close can still block
 	 * on such a peer: it hangs that one caller, as any close of such a socket does in httpclient,
 	 * but not the deadlines of the other connections.
@@ -1411,9 +1415,10 @@ public class B3HttpClientConnection implements HttpConnection {
 	 * armed. The reader disarms it as soon as its loop ends, before anything releases or closes the
 	 * connection on purpose. What is left is a body that reaches its end as the timer fires: the
 	 * shutdown lands either on a socket httpclient has already released and closed, where it does
-	 * nothing, or on one whose body is already in, which {@code read} still takes as whole when the
-	 * body is framed by a length or by chunks. A socket is never reused: a connection reopened for
-	 * the next hop gets a new one.
+	 * nothing, or on one whose remaining bytes httpcore has already buffered, which {@code read}
+	 * still takes as whole when the body is framed by a length or by chunks; bytes still in the
+	 * kernel or the TLS record buffer are dropped by the shutdown, and that body is cut short. A
+	 * socket is never reused: a connection reopened for the next hop gets a new one.
 	 * <p>
 	 * One daemon thread serves the whole process, and a disarmed task is cancelled and removed from
 	 * its queue at once, so the cost per non-200 body read is one scheduled task: one allocation and
