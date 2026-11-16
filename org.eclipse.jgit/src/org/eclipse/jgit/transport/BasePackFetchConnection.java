@@ -27,6 +27,8 @@ import static org.eclipse.jgit.transport.GitProtocolConstants.PACKET_WANT;
 // BBB customization begin
 import com.bigbrassband.common.apache.ErrInFetchAnswerPackProtocolException;
 import com.bigbrassband.common.apache.ErrInFetchAnswerRemoteRepositoryException;
+import com.bigbrassband.common.apache.FetchAnswerFailure;
+import java.util.LinkedHashMap;
 // BBB customization end
 import java.io.IOException;
 import java.io.InputStream;
@@ -253,6 +255,11 @@ public abstract class BasePackFetchConnection extends BasePackConnection
 	 */
 	private final FilterSpec filterSpec;
 
+	// BBB customization begin
+	// The wants sendWants wrote, without those it skipped as already present.
+	private final Map<String, ObjectId> sentWants = new LinkedHashMap<>();
+	// BBB customization end
+
 	/**
 	 * Create a new connection to fetch using the native git transport.
 	 *
@@ -470,10 +477,23 @@ public abstract class BasePackFetchConnection extends BasePackConnection
 			close();
 			return; // Caller should test (or just know) this themselves.
 		} catch (IOException | RuntimeException err) {
+			// BBB customization begin
+			attachWants(err);
+			// BBB customization end
 			close();
 			throw new TransportException(err.getMessage(), err);
 		}
 	}
+
+	// BBB customization begin
+	private void attachWants(Throwable err) {
+		for (Throwable t = err; t != null; t = t.getCause()) {
+			if (t instanceof FetchAnswerFailure failure) {
+				failure.setWants(sentWants);
+			}
+		}
+	}
+	// BBB customization end
 
 	private void doFetchV2(ProgressMonitor monitor, Collection<Ref> want,
 			OutputStream outputStream, boolean hasObjects)
@@ -818,6 +838,9 @@ public abstract class BasePackFetchConnection extends BasePackConnection
 	private boolean sendWants(Collection<Ref> want, PacketLineOut p,
 			boolean hasObjects)
 			throws IOException {
+		// BBB customization begin
+		sentWants.clear();
+		// BBB customization end
 		boolean first = true;
 		for (Ref r : want) {
 			ObjectId objectId = r.getObjectId();
@@ -850,6 +873,9 @@ public abstract class BasePackFetchConnection extends BasePackConnection
 			first = false;
 			line.append('\n');
 			p.writeString(line.toString());
+			// BBB customization begin
+			sentWants.put(r.getName(), objectId);
+			// BBB customization end
 		}
 		if (first) {
 			return false;

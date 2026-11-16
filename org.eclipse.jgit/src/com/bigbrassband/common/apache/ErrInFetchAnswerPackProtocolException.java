@@ -1,6 +1,11 @@
 package com.bigbrassband.common.apache;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 import org.eclipse.jgit.errors.PackProtocolException;
+import org.eclipse.jgit.lib.ObjectId;
 
 /**
  * An {@link ErrInFetchAnswer} where JGit reports a remote's ERR line as a
@@ -11,6 +16,8 @@ public class ErrInFetchAnswerPackProtocolException extends PackProtocolException
 	private static final long serialVersionUID = 1L;
 
 	private final String errText;
+
+	private Map<String, ObjectId> wants = Collections.emptyMap();
 
 	/**
 	 * @param message
@@ -27,5 +34,15 @@ public class ErrInFetchAnswerPackProtocolException extends PackProtocolException
 	@Override
 	public String getErrText() {
 		return errText;
+	}
+
+	@Override
+	public Map<String, ObjectId> getWants() {
+		return wants;
+	}
+
+	@Override
+	public void setWants(Map<String, ObjectId> wants) {
+		this.wants = Collections.unmodifiableMap(new LinkedHashMap<>(wants));
 	}
 }

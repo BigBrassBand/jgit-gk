@@ -6,7 +6,7 @@ package com.bigbrassband.common.apache;
  * advertisement, before any request, is not one. The exception keeps the type
  * and the message JGit gives the same failure.
  */
-public interface ErrInFetchAnswer {
+public interface ErrInFetchAnswer extends FetchAnswerFailure {
 
 	/**
 	 * @return the text of the ERR line, without its {@code ERR } prefix

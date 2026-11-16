@@ -1,6 +1,11 @@
 package com.bigbrassband.common.apache;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 import org.eclipse.jgit.errors.RemoteRepositoryException;
+import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.transport.URIish;
 
 /**
@@ -12,6 +17,8 @@ public class ErrInFetchAnswerRemoteRepositoryException
 	private static final long serialVersionUID = 1L;
 
 	private final String errText;
+
+	private Map<String, ObjectId> wants = Collections.emptyMap();
 
 	/**
 	 * @param uri
@@ -28,5 +35,15 @@ public class ErrInFetchAnswerRemoteRepositoryException
 	@Override
 	public String getErrText() {
 		return errText;
+	}
+
+	@Override
+	public Map<String, ObjectId> getWants() {
+		return wants;
+	}
+
+	@Override
+	public void setWants(Map<String, ObjectId> wants) {
+		this.wants = Collections.unmodifiableMap(new LinkedHashMap<>(wants));
 	}
 }

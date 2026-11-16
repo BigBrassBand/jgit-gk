@@ -1,5 +1,10 @@
 package com.bigbrassband.common.apache;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.transport.URIish;
 
 /**
@@ -8,8 +13,10 @@ import org.eclipse.jgit.transport.URIish;
  * receive-pack request throw the parent type.
  */
 public class HttpStatusInFetchAnswerException
-		extends HttpStatusTransportException {
+		extends HttpStatusTransportException implements FetchAnswerFailure {
 	private static final long serialVersionUID = 1L;
+
+	private Map<String, ObjectId> wants = Collections.emptyMap();
 
 	/**
 	 * @param uri
@@ -22,5 +29,15 @@ public class HttpStatusInFetchAnswerException
 	public HttpStatusInFetchAnswerException(URIish uri, int status,
 			String message) {
 		super(uri, status, message);
+	}
+
+	@Override
+	public Map<String, ObjectId> getWants() {
+		return wants;
+	}
+
+	@Override
+	public void setWants(Map<String, ObjectId> wants) {
+		this.wants = Collections.unmodifiableMap(new LinkedHashMap<>(wants));
 	}
 }
